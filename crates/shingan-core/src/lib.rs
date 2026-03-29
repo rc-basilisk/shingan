@@ -27,10 +27,18 @@
 //!    ([`scanner::FileScanner::with_size_limits`]), and track permission-denied /
 //!    I/O errors in [`scanner::ScanResult`].
 //! 2. **Fingerprinting** -- compute a signature for every discovered file using the
-//!    appropriate detector (parallelized with rayon).
+//!    appropriate detector (parallelized with rayon). Pre-cached signatures from a
+//!    previous scan can be supplied via
+//!    [`scanner::duplicate::DuplicateScanner::with_cached_signatures`] to skip
+//!    recomputation for unchanged files.
 //! 3. **Grouping** -- cluster files whose similarity exceeds the configured threshold
 //!    using LSH prefix bucketing and a union-find structure with strict cross-validation
 //!    (see [`scanner::grouping`]).
+//!
+//! [`scanner::duplicate::DuplicateScanner::scan_paths`] returns both the duplicate
+//! groups and a list of newly computed `(path, signature)` pairs that the caller
+//! should persist (e.g. to the `signature_cache` table in `shingan-db`) so that
+//! future rescans benefit from the cache.
 //!
 //! ## Feature flags
 //!
@@ -60,7 +68,8 @@
 //! let control = Arc::new(ScanControl::new());
 //! let scanner = DuplicateScanner::new(&categories, detectors, threshold, control, tx);
 //!
-//! let results = scanner.scan_paths(&[("./my_files".into(), true)]);
+//! let (results, new_sigs) = scanner.scan_paths(&[("./my_files".into(), true)]);
+//! // Persist new_sigs to the database for future rescans.
 //! ```
 
 pub mod cache;

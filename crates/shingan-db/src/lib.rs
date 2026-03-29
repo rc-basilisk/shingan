@@ -16,6 +16,10 @@
 //!   are indexed for fast lookups and session listing.
 //! - **Batch inserts** -- [`Database::insert_duplicate_groups_batch`] persists multiple
 //!   groups in a single transaction, reducing lock overhead and write latency.
+//! - **Signature cache** -- [`Database::get_cached_signatures`] and
+//!   [`Database::cache_signatures_batch`] provide persistent cross-scan signature
+//!   storage keyed by `(file_path, file_size, modified_at, category)`. Unchanged
+//!   files resolve from cache, making rescans near-instant for previously seen files.
 
 pub mod models;
 pub mod repository;

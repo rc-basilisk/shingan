@@ -27,9 +27,11 @@ shingan is a high-performance file deduplication toolkit written in Rust. It det
 - **3-phase scanning** -- file discovery, parallel signature analysis, union-find fuzzy grouping with strict membership validation
 - **5 detection engines** -- image, video, document, code, and archive, each with specialized algorithms
 - **Pluggable architecture** -- compile only the detectors you need via feature flags
-- **LRU caching** -- per-detector signature and parse caches (`parking_lot::Mutex`) for fast rescans and comparisons
+- **Persistent signature cache** -- computed signatures are stored in SQLite keyed by file path, size, and modification time; rescanning unchanged files skips computation entirely
+- **In-memory LRU caches** -- per-detector signature and parse caches (`parking_lot::Mutex`) for fast within-scan comparisons
 - **File size filtering** -- configurable min/max size limits with skip-count reporting
 - **Pause / resume / stop** -- full scan lifecycle control
+- **Progress tracking** -- elapsed time, ETA, and percentage displayed in both CLI and GUI progress bars
 - **GUI with preview** -- image thumbnails, syntax-highlighted code, PDF pages, video frames; paginated results (50 groups/page)
 - **Auto-sorter** -- rule-based file organization with optional Ollama-powered ML categorization
 - **SQLite persistence** -- WAL mode, indexed queries, batch inserts with transactions, full scan history
@@ -134,6 +136,7 @@ shingan is organized as a Cargo workspace with five crates:
 - **Union-find grouping** -- duplicate candidates are clustered using LSH prefix bucketing, then merged via a union-find structure with path compression and union-by-rank. An incrementally maintained member map avoids O(n) scans per merge. Strict cross-validation before each merge ensures every file in a group is similar to every other file.
 - **rayon** -- signature computation is parallelized across available cores.
 - **crossbeam-channel** -- progress updates flow from worker threads to the UI without blocking.
+- **Persistent signature cache** -- a `signature_cache` table stores computed signatures keyed by `(file_path, file_size, modified_at, category)`. On rescan, unchanged files resolve from cache in microseconds instead of recomputing from disk. Modified files are automatically invalidated and recomputed.
 - **Batch DB inserts** -- duplicate groups are persisted in a single SQLite transaction, reducing lock contention and improving write throughput.
 - **Indexed queries** -- `file_path` and `created_at` columns are indexed for fast lookups and session listing.
 
