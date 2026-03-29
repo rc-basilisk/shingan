@@ -37,3 +37,4 @@ logo/
 *.log
 *.bak
 *.tmp
+.ruff_cache/

@@ -6,6 +6,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
+/// Callback signature for reporting scan progress (path, file count so far).
+type ScanProgressCallback<'a> = Option<&'a dyn Fn(&Path, usize)>;
+
 pub struct ScanResult {
     pub files: Vec<FileInfo>,
     pub skipped_permission: u32,
@@ -41,7 +44,7 @@ impl FileScanner {
         &self,
         root: &Path,
         include_subdirs: bool,
-        progress: Option<&dyn Fn(&Path, usize)>,
+        progress: ScanProgressCallback<'_>,
     ) -> ScanResult {
         let mut files = Vec::new();
         let mut skipped_permission: u32 = 0;

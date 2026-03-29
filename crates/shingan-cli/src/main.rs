@@ -58,6 +58,21 @@ enum Commands {
         #[arg(short, long, default_value = "results.csv")]
         output: PathBuf,
     },
+
+    /// Sort files into category directories
+    Sort {
+        /// Source directories to sort
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Destination directory
+        #[arg(short, long)]
+        dest: PathBuf,
+
+        /// Use local ML to sub-categorize images
+        #[arg(long)]
+        classify: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -73,6 +88,11 @@ fn main() -> anyhow::Result<()> {
         } => cmd_scan(&db, paths, types, threshold, !no_recursive)?,
         Commands::List { session_id } => cmd_list(&db, session_id)?,
         Commands::Export { session_id, output } => cmd_export(&db, session_id, &output)?,
+        Commands::Sort {
+            paths,
+            dest,
+            classify,
+        } => cmd_sort(paths, dest, classify)?,
     }
 
     Ok(())
@@ -450,6 +470,36 @@ fn load_cached_signatures_cli(
         .collect();
 
     db.get_cached_signatures(&query_refs).unwrap_or_default()
+}
+
+fn cmd_sort(
+    paths: Vec<PathBuf>,
+    dest: PathBuf,
+    classify: bool,
+) -> anyhow::Result<()> {
+    let sorter = shingan_utils::auto_sorter::AutoSorter::new(paths, dest).with_ml(classify);
+
+    let stats = sorter.sort_files(
+        Some(&|current, total, filepath| {
+            let pct = if total > 0 {
+                (current as f64 / total as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            eprint!("\r[{:3}%] {}/{}: {}", pct, current, total, filepath);
+        }),
+        Some(&|msg| {
+            eprintln!("{}", msg);
+        }),
+    );
+
+    eprintln!();
+    println!(
+        "Sort complete: {} moved, {} failed, {} skipped (of {} total)",
+        stats.moved, stats.failed, stats.skipped, stats.total
+    );
+
+    Ok(())
 }
 
 fn persist_new_signatures_cli(

@@ -11,6 +11,7 @@ path = "src/main.rs"
 shingan-core.workspace = true
 shingan-db.workspace = true
 shingan-utils.workspace = true
+shingan-ml.workspace = true
 iced.workspace = true
 rfd.workspace = true
 tokio.workspace = true

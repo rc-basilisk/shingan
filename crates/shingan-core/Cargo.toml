@@ -21,9 +21,12 @@ walkdir.workspace = true
 rayon.workspace = true
 crossbeam-channel.workspace = true
 mime_guess.workspace = true
+infer.workspace = true
+kamadak-exif.workspace = true
+# Used by enrichment (dimensions) and optional for future; detectors use image 0.23 via image_for_hash.
+image.workspace = true
 
 # Optional per-detector deps
-image = { workspace = true, optional = true }
 img_hash = { workspace = true, optional = true }
 vid_dup_finder_lib = { workspace = true, optional = true }
 # img_hash depends on image 0.23 with default-features=false (no format decoders).

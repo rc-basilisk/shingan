@@ -2,6 +2,7 @@
 members = [
     "crates/shingan-core",
     "crates/shingan-db",
+    "crates/shingan-ml",
     "crates/shingan-utils",
     "crates/shingan-cli",
     "crates/shingan-gui",
@@ -26,6 +27,8 @@ rayon = "1"
 crossbeam-channel = "0.5"
 dirs = "6"
 mime_guess = "2"
+infer = "0.19"
+kamadak-exif = "0.6"
 
 # Image processing
 image = "0.25"
@@ -61,7 +64,12 @@ clap = { version = "4", features = ["derive"] }
 iced = { version = "0.13", features = ["image", "tokio"] }
 rfd = "0.15"
 
+# ML / ONNX (local inference)
+ort = "2.0.0-rc.12"
+ndarray = "0.17"
+
 # Internal crates
 shingan-core = { path = "crates/shingan-core" }
 shingan-db = { path = "crates/shingan-db" }
 shingan-utils = { path = "crates/shingan-utils" }
+shingan-ml = { path = "crates/shingan-ml" }

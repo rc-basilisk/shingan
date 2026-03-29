@@ -341,6 +341,61 @@ impl Database {
         })
     }
 
+    // --- Classification Cache ---
+
+    /// Look up cached classifications for unchanged files.
+    pub fn get_cached_classifications(
+        &self,
+        files: &[(&str, i64, i64)], // (path, size, modified_secs)
+    ) -> Result<HashMap<String, (String, f64, i64)>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sub_category, confidence, tier FROM classification_cache
+                 WHERE file_path = ?1 AND file_size = ?2 AND modified_at = ?3",
+            )?;
+            let mut result = HashMap::new();
+            for &(path, size, mtime) in files {
+                if let Ok((sub_cat, conf, tier)) = stmt.query_row(
+                    params![path, size, mtime],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?)),
+                ) {
+                    result.insert(path.to_string(), (sub_cat, conf, tier));
+                }
+            }
+            Ok(result)
+        })
+    }
+
+    /// Upsert classification results.
+    pub fn cache_classifications_batch(
+        &self,
+        entries: &[(&str, i64, i64, &str, f64, i64)], // (path, size, mtime, sub_category, confidence, tier)
+    ) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN TRANSACTION")?;
+            let result = (|| -> Result<(), DbError> {
+                for &(path, size, mtime, sub_cat, conf, tier) in entries {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO classification_cache (file_path, file_size, modified_at, sub_category, confidence, tier)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![path, size, mtime, sub_cat, conf, tier],
+                    )?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK").ok();
+                    Err(e)
+                }
+            }
+        })
+    }
+
     // --- Maintenance ---
 
     pub fn vacuum(&self) -> Result<(), DbError> {

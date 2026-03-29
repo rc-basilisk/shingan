@@ -74,6 +74,7 @@
 
 pub mod cache;
 pub mod detector;
+pub mod enrichment;
 pub mod error;
 pub mod file_info;
 pub mod scanner;

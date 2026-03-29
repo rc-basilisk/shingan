@@ -132,7 +132,7 @@ impl AutoSorterState {
 
         // Options
         content = content.push(
-            checkbox("Use ML for image categorization (requires Ollama)", self.use_ml)
+            checkbox("Sort images into sub-categories (local ML)", self.use_ml)
                 .on_toggle(SorterMessage::ToggleML),
         );
 

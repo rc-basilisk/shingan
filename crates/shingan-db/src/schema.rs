@@ -60,6 +60,16 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             use_ml_categorization INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'pending'
         );
+
+        CREATE TABLE IF NOT EXISTS classification_cache (
+            file_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            modified_at INTEGER NOT NULL,
+            sub_category TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            tier INTEGER NOT NULL,
+            PRIMARY KEY (file_path)
+        );
         ",
     )?;
 

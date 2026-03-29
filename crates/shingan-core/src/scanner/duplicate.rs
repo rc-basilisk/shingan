@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Duplicate groups keyed by category, plus newly computed `(path, signature)` pairs to persist.
+pub type ScanOutcome = (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<(String, String)>);
+
 /// Progress messages sent from the scanner to the UI.
 #[derive(Debug, Clone)]
 pub enum ScanProgress {
@@ -131,7 +134,7 @@ impl DuplicateScanner {
     pub fn scan_paths(
         &self,
         paths: &[(PathBuf, bool)],
-    ) -> (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<(String, String)>) {
+    ) -> ScanOutcome {
         let mut all_results: HashMap<FileCategory, Vec<DuplicateGroup>> = HashMap::new();
         let mut all_new_signatures: Vec<(String, String)> = Vec::new();
 

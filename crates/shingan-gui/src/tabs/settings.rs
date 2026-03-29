@@ -8,6 +8,9 @@ pub struct SettingsState {
     pub cache_size_mb: String,
     pub ollama_url: String,
     pub vision_model: String,
+    pub ml_model_path: String,
+    pub confidence_threshold: String,
+    pub cloud_enabled: bool,
     pub status_message: Option<String>,
 }
 
@@ -17,6 +20,9 @@ pub enum SettingsMessage {
     CacheSizeChanged(String),
     OllamaUrlChanged(String),
     VisionModelChanged(String),
+    MlModelPathChanged(String),
+    ConfidenceThresholdChanged(String),
+    ToggleCloud(bool),
     SaveSettings,
     ClearSessions,
     OptimizeDb,
@@ -31,6 +37,9 @@ impl Default for SettingsState {
             cache_size_mb: settings.cache_size_mb.to_string(),
             ollama_url: settings.ollama_url,
             vision_model: settings.vision_model,
+            ml_model_path: settings.ml_model_path.unwrap_or_default(),
+            confidence_threshold: format!("{:.2}", settings.classification_confidence_threshold),
+            cloud_enabled: settings.cloud_enabled,
             status_message: None,
         }
     }
@@ -43,12 +52,25 @@ impl SettingsState {
             SettingsMessage::CacheSizeChanged(val) => self.cache_size_mb = val,
             SettingsMessage::OllamaUrlChanged(val) => self.ollama_url = val,
             SettingsMessage::VisionModelChanged(val) => self.vision_model = val,
+            SettingsMessage::MlModelPathChanged(val) => self.ml_model_path = val,
+            SettingsMessage::ConfidenceThresholdChanged(val) => self.confidence_threshold = val,
+            SettingsMessage::ToggleCloud(val) => self.cloud_enabled = val,
             SettingsMessage::SaveSettings => {
                 let settings = AppSettings {
                     thread_count: self.thread_count.parse().unwrap_or(4),
                     cache_size_mb: self.cache_size_mb.parse().unwrap_or(500),
                     ollama_url: self.ollama_url.clone(),
                     vision_model: self.vision_model.clone(),
+                    ml_model_path: if self.ml_model_path.is_empty() {
+                        None
+                    } else {
+                        Some(self.ml_model_path.clone())
+                    },
+                    classification_confidence_threshold: self
+                        .confidence_threshold
+                        .parse()
+                        .unwrap_or(0.6),
+                    cloud_enabled: self.cloud_enabled,
                 };
                 match save_settings(&settings) {
                     Ok(_) => self.status_message = Some("Settings saved!".to_string()),
@@ -101,8 +123,33 @@ impl SettingsState {
             .spacing(10),
         );
 
-        // ML settings
-        content = content.push(text("ML Categorization (Ollama)").size(18));
+        // Local ML
+        content = content.push(text("Local ML Categorization").size(18));
+        content = content.push(
+            row![
+                text("Confidence threshold:").width(200),
+                text_input("0.60", &self.confidence_threshold)
+                    .on_input(SettingsMessage::ConfidenceThresholdChanged)
+                    .width(100),
+            ]
+            .spacing(10),
+        );
+        content = content.push(
+            row![
+                text("Custom model path (optional):").width(200),
+                text_input("", &self.ml_model_path)
+                    .on_input(SettingsMessage::MlModelPathChanged)
+                    .width(Length::Fill),
+            ]
+            .spacing(10),
+        );
+
+        // Cloud APIs (Advanced)
+        content = content.push(text("Cloud APIs (Advanced)").size(18));
+        content = content.push(
+            iced::widget::checkbox("Enable cloud escalation (API key required)", self.cloud_enabled)
+                .on_toggle(SettingsMessage::ToggleCloud),
+        );
         content = content.push(
             row![
                 text("Ollama API URL:").width(200),
@@ -152,8 +199,26 @@ impl SettingsState {
 pub struct AppSettings {
     pub thread_count: u32,
     pub cache_size_mb: u32,
+    #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    #[serde(default = "default_vision_model")]
     pub vision_model: String,
+    #[serde(default)]
+    pub ml_model_path: Option<String>,
+    #[serde(default = "default_confidence_threshold")]
+    pub classification_confidence_threshold: f32,
+    #[serde(default)]
+    pub cloud_enabled: bool,
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+fn default_vision_model() -> String {
+    "llava".to_string()
+}
+fn default_confidence_threshold() -> f32 {
+    0.6
 }
 
 impl Default for AppSettings {
@@ -161,8 +226,11 @@ impl Default for AppSettings {
         Self {
             thread_count: 4,
             cache_size_mb: 500,
-            ollama_url: "http://localhost:11434".to_string(),
-            vision_model: "llava".to_string(),
+            ollama_url: default_ollama_url(),
+            vision_model: default_vision_model(),
+            ml_model_path: None,
+            classification_confidence_threshold: default_confidence_threshold(),
+            cloud_enabled: false,
         }
     }
 }

@@ -1,11 +1,18 @@
-use shingan_core::file_info::ExtensionMap;
+use shingan_core::file_info::{ExtensionMap, FileCategory, FileInfo};
+use shingan_ml::{PipelineConfig, TieredPipeline};
 use std::path::{Path, PathBuf};
 
+/// Callback signature for reporting sort progress (current, total, file path).
+type ProgressCallback<'a> = Option<&'a dyn Fn(u64, u64, &str)>;
+
 /// Sorts files from source directories into category-based subdirectories.
+/// When `use_ml` is true, images are further sub-categorized via the local
+/// tiered ML pipeline (heuristics -> structure -> ONNX).
 pub struct AutoSorter {
     source_paths: Vec<PathBuf>,
     destination: PathBuf,
     extension_map: ExtensionMap,
+    use_ml: bool,
 }
 
 /// Statistics returned after sorting completes.
@@ -23,21 +30,29 @@ impl AutoSorter {
             source_paths,
             destination,
             extension_map: ExtensionMap::new(),
+            use_ml: false,
         }
+    }
+
+    pub fn with_ml(mut self, enable: bool) -> Self {
+        self.use_ml = enable;
+        self
     }
 
     /// Sort files into category directories.
     pub fn sort_files(
         &self,
-        progress: Option<&dyn Fn(u64, u64, &str)>,
+        progress: ProgressCallback<'_>,
         status: Option<&dyn Fn(&str)>,
     ) -> SortStats {
         let mut stats = SortStats::default();
 
-        // Collect all files first
         let mut all_files: Vec<PathBuf> = Vec::new();
         for source in &self.source_paths {
-            if let Ok(entries) = walkdir::WalkDir::new(source).into_iter().collect::<Result<Vec<_>, _>>() {
+            if let Ok(entries) = walkdir::WalkDir::new(source)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+            {
                 for entry in entries {
                     if entry.file_type().is_file() {
                         all_files.push(entry.into_path());
@@ -52,6 +67,12 @@ impl AutoSorter {
             cb(&format!("Found {} files to sort", stats.total));
         }
 
+        let mut pipeline = if self.use_ml {
+            Some(TieredPipeline::new(PipelineConfig::default()))
+        } else {
+            None
+        };
+
         for (i, file_path) in all_files.iter().enumerate() {
             if let Some(cb) = progress {
                 cb(i as u64 + 1, stats.total, &file_path.to_string_lossy());
@@ -65,13 +86,23 @@ impl AutoSorter {
                 }
             };
 
-            let category_name = self
-                .extension_map
-                .get(&ext)
+            let category = self.extension_map.get(&ext);
+            let category_name = category
                 .map(|c| format!("{}s", c.label()))
                 .unwrap_or_else(|| "others".to_string());
 
-            let dest_dir = self.destination.join(&category_name);
+            let sub_folder = if self.use_ml && category == Some(FileCategory::Image) {
+                self.classify_image(file_path, &ext, &mut pipeline)
+            } else {
+                None
+            };
+
+            let dest_dir = if let Some(ref sub) = sub_folder {
+                self.destination.join(&category_name).join(sub)
+            } else {
+                self.destination.join(&category_name)
+            };
+
             if std::fs::create_dir_all(&dest_dir).is_err() {
                 stats.failed += 1;
                 continue;
@@ -87,16 +118,13 @@ impl AutoSorter {
 
             match std::fs::rename(file_path, &dest_path) {
                 Ok(_) => stats.moved += 1,
-                Err(_) => {
-                    // Try copy + delete as fallback (cross-device move)
-                    match std::fs::copy(file_path, &dest_path) {
-                        Ok(_) => {
-                            let _ = std::fs::remove_file(file_path);
-                            stats.moved += 1;
-                        }
-                        Err(_) => stats.failed += 1,
+                Err(_) => match std::fs::copy(file_path, &dest_path) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(file_path);
+                        stats.moved += 1;
                     }
-                }
+                    Err(_) => stats.failed += 1,
+                },
             }
         }
 
@@ -108,6 +136,19 @@ impl AutoSorter {
         }
 
         stats
+    }
+
+    fn classify_image(
+        &self,
+        path: &Path,
+        _ext: &str,
+        pipeline: &mut Option<TieredPipeline>,
+    ) -> Option<String> {
+        let pipeline = pipeline.as_mut()?;
+        let mut info = FileInfo::from_path(path, FileCategory::Image).ok()?;
+        info.enrich_metadata();
+        let result = pipeline.classify_local(path, &info);
+        Some(result.category.label().to_string())
     }
 }
 

@@ -58,6 +58,17 @@ pub struct FileInfo {
     pub name: String,
     pub extension: String,
     pub category: FileCategory,
+    /// Sniffed or guessed MIME type (when enriched).
+    pub mime_type: Option<String>,
+    /// Image width/height when decodable (when enriched).
+    pub dimensions: Option<(u32, u32)>,
+    /// True when EXIF suggests camera/scan capture (when enriched).
+    pub has_exif: bool,
+    /// Last classification sub-category label (e.g. image sub-folder name).
+    pub sub_category: Option<String>,
+    pub classification_confidence: Option<f32>,
+    /// Classification tier (0=heuristics, 1=structure, 2=local ONNX, 3=cloud).
+    pub classification_tier: Option<u8>,
 }
 
 impl FileInfo {
@@ -79,7 +90,25 @@ impl FileInfo {
             name,
             extension,
             category,
+            mime_type: None,
+            dimensions: None,
+            has_exif: false,
+            sub_category: None,
+            classification_confidence: None,
+            classification_tier: None,
         })
+    }
+
+    /// Fill MIME, dimensions, and EXIF flag for image files (no-op for other categories).
+    pub fn enrich_metadata(&mut self) {
+        crate::enrichment::enrich_image_file_info(
+            &self.path,
+            &self.extension,
+            self.category,
+            &mut self.mime_type,
+            &mut self.dimensions,
+            &mut self.has_exif,
+        );
     }
 }
 

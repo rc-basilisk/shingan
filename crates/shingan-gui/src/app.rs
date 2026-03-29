@@ -225,11 +225,12 @@ impl App {
             let sources: Vec<PathBuf> =
                 self.sorter.source_paths.iter().map(PathBuf::from).collect();
             let dest = PathBuf::from(&self.sorter.destination);
+            let use_ml = self.sorter.use_ml;
 
             subs.push(
                 Subscription::run_with_id(
                     "sorter",
-                    sort_subscription(sources, dest),
+                    sort_subscription(sources, dest, use_ml),
                 )
                 .map(Message::Sorter),
             );
@@ -530,6 +531,7 @@ fn persist_new_signatures(
 fn sort_subscription(
     sources: Vec<PathBuf>,
     destination: PathBuf,
+    use_ml: bool,
 ) -> impl futures::Stream<Item = SorterMessage> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
@@ -539,7 +541,8 @@ fn sort_subscription(
         let tx = progress_tx.clone();
         tokio::task::spawn_blocking(move || {
             let sorter =
-                shingan_utils::auto_sorter::AutoSorter::new(sources, destination);
+                shingan_utils::auto_sorter::AutoSorter::new(sources, destination)
+                    .with_ml(use_ml);
             let stats = sorter.sort_files(
                 Some(&|current, total, filepath| {
                     let _ = tx.send(SorterMessage::SortProgress {
