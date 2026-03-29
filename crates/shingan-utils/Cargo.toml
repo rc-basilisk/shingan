@@ -1,0 +1,15 @@
+[package]
+name = "shingan-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shingan-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+dirs.workspace = true
+mime_guess.workspace = true
+walkdir.workspace = true

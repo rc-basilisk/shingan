@@ -1,0 +1,39 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Note: Cargo.lock is committed (workspace contains binaries)
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+*~
+
+# IDE / Editor
+.idea/
+.vscode/
+*.iml
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# Environment
+.env
+.env.*
+
+# Logo generation tooling
+logo/
+
+# Misc
+*.log
+*.bak
+*.tmp

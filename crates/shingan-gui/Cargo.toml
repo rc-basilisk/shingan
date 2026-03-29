@@ -1,0 +1,23 @@
+[package]
+name = "shingan-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shingan-gui"
+path = "src/main.rs"
+
+[dependencies]
+shingan-core.workspace = true
+shingan-db.workspace = true
+shingan-utils.workspace = true
+iced.workspace = true
+rfd.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+image.workspace = true
+crossbeam-channel.workspace = true
+futures = "0.3"
+syntect.workspace = true

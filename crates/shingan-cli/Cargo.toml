@@ -1,0 +1,15 @@
+[package]
+name = "shingan-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shingan"
+path = "src/main.rs"
+
+[dependencies]
+shingan-core.workspace = true
+shingan-db.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true

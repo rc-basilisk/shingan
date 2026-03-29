@@ -1,0 +1,36 @@
+[package]
+name = "shingan-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["image-detect", "document-detect", "code-detect", "video-detect"]
+image-detect = ["dep:img_hash", "dep:image_for_hash"]
+video-detect = ["dep:vid_dup_finder_lib"]
+document-detect = ["dep:zip", "dep:quick-xml", "dep:pdf-extract", "dep:strsim"]
+code-detect = ["dep:strsim"]
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+lru.workspace = true
+walkdir.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+mime_guess.workspace = true
+
+# Optional per-detector deps
+image = { workspace = true, optional = true }
+img_hash = { workspace = true, optional = true }
+vid_dup_finder_lib = { workspace = true, optional = true }
+# img_hash depends on image 0.23 with default-features=false (no format decoders).
+# This dep unifies with img_hash's image 0.23 and enables png/jpeg/gif/bmp/tiff/webp support.
+image_for_hash = { package = "image", version = "0.23", default-features = true, optional = true }
+ffmpeg-next = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+pdf-extract = { workspace = true, optional = true }
+rapidfuzz = { workspace = true, optional = true }
+strsim = { workspace = true, optional = true }

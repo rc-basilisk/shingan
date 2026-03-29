@@ -1,0 +1,270 @@
+//! CLI entry point for shingan (心眼), a multi-modal duplicate file detector.
+//!
+//! Provides the `scan`, `list`, and `export` subcommands. Run `shingan --help`
+//! for usage details.
+
+use clap::{Parser, Subcommand};
+use shingan_core::detector::archive::ArchiveDetector;
+use shingan_core::detector::Detector;
+use shingan_core::file_info::FileCategory;
+use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
+use shingan_db::models::*;
+use shingan_db::Database;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "shingan", about = "Shingan — file deduplicator CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Scan directories for duplicate files
+    Scan {
+        /// Directories to scan
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// File types to scan (image, document, video, archive, code)
+        #[arg(short, long, default_values_t = vec!["image".to_string(), "document".to_string()])]
+        types: Vec<String>,
+
+        /// Similarity threshold (0.80 - 1.00)
+        #[arg(short = 'T', long, default_value_t = 0.95)]
+        threshold: f64,
+
+        /// Don't recurse into subdirectories
+        #[arg(long)]
+        no_recursive: bool,
+    },
+
+    /// List scan sessions
+    List {
+        /// Show details for a specific session
+        session_id: Option<i64>,
+    },
+
+    /// Export scan results to CSV
+    Export {
+        /// Session ID to export
+        session_id: i64,
+
+        /// Output file path
+        #[arg(short, long, default_value = "results.csv")]
+        output: PathBuf,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let db = Database::open(None).expect("Failed to open database");
+
+    match cli.command {
+        Commands::Scan {
+            paths,
+            types,
+            threshold,
+            no_recursive,
+        } => cmd_scan(&db, paths, types, threshold, !no_recursive),
+        Commands::List { session_id } => cmd_list(&db, session_id),
+        Commands::Export { session_id, output } => cmd_export(&db, session_id, &output),
+    }
+}
+
+fn cmd_scan(db: &Database, paths: Vec<PathBuf>, types: Vec<String>, threshold: f64, recursive: bool) {
+    let categories: Vec<FileCategory> = types
+        .iter()
+        .filter_map(|t| FileCategory::from_label(t))
+        .collect();
+
+    if categories.is_empty() {
+        eprintln!("Error: No valid file types specified");
+        std::process::exit(1);
+    }
+
+    let file_types_json = serde_json::to_string(&types).unwrap();
+    let session_id = db
+        .create_scan_session(
+            &format!("CLI scan {} paths", paths.len()),
+            &file_types_json,
+            threshold,
+        )
+        .expect("Failed to create scan session");
+
+    db.update_session_status(session_id, "running").ok();
+
+    // Build detectors for each requested category
+    let mut detectors: HashMap<FileCategory, Box<dyn Detector>> = HashMap::new();
+    for cat in &categories {
+        let detector: Option<Box<dyn Detector>> = match cat {
+            FileCategory::Archive => Some(Box::new(ArchiveDetector::new(threshold))),
+            FileCategory::Image => {
+                Some(Box::new(shingan_core::detector::image::ImageDetector::new(threshold, 12)))
+            }
+            FileCategory::Code => {
+                Some(Box::new(shingan_core::detector::code::CodeDetector::new(threshold)))
+            }
+            FileCategory::Document => {
+                Some(Box::new(shingan_core::detector::document::DocumentDetector::new(threshold)))
+            }
+            FileCategory::Video => {
+                Some(Box::new(shingan_core::detector::video::VideoDetector::new(threshold)))
+            }
+        };
+        if let Some(d) = detector {
+            detectors.insert(*cat, d);
+        }
+    }
+
+    let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
+    let control = Arc::new(ScanControl::new());
+
+    let scanner = DuplicateScanner::new(&categories, detectors, threshold, control.clone(), progress_tx);
+
+    // Run scanner in background thread
+    let scan_paths: Vec<(PathBuf, bool)> = paths.iter().map(|p| (p.clone(), recursive)).collect();
+
+    let handle = std::thread::spawn(move || scanner.scan_paths(&scan_paths));
+
+    // Print progress
+    for msg in &progress_rx {
+        match msg {
+            ScanProgress::Status(s) => eprintln!("{}", s),
+            ScanProgress::Progress { current, total, message } => {
+                if total > 0 {
+                    let pct = (current as f64 / total as f64 * 100.0) as u32;
+                    eprint!("\r[{:3}%] {}", pct, message);
+                }
+            }
+            ScanProgress::PhaseCompleted { category, groups } => {
+                eprintln!("\n  Found {} {} duplicate groups", groups.len(), category.label());
+
+                // Persist to database
+                for group in &groups {
+                    let group_id = db
+                        .insert_duplicate_group(&NewDuplicateGroup {
+                            session_id,
+                            file_type: category.label(),
+                            similarity_score: group.similarity,
+                            hash_value: None,
+                        })
+                        .expect("Failed to insert group");
+
+                    for file_path in &group.files {
+                        let meta = std::fs::metadata(file_path).ok();
+                        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+                        let modified = meta
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| {
+                                t.duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| {
+                                        chrono_format_timestamp(d.as_secs())
+                                    })
+                            });
+
+                        db.insert_file_entry(&NewFileEntry {
+                            group_id,
+                            file_path: &file_path.to_string_lossy(),
+                            file_size: size,
+                            modified_time: modified.as_deref(),
+                            thumbnail_path: None,
+                            file_metadata: None,
+                        })
+                        .expect("Failed to insert file entry");
+                    }
+                }
+            }
+            ScanProgress::Completed => {
+                eprintln!("\nScan complete!");
+            }
+            ScanProgress::Error(e) => {
+                eprintln!("\nError: {}", e);
+            }
+        }
+    }
+
+    let results = handle.join().expect("Scanner thread panicked");
+    db.update_session_status(session_id, "completed").ok();
+
+    let total_groups: usize = results.values().map(|g| g.len()).sum();
+    let total_files: usize = results.values().flat_map(|g| g.iter()).map(|g| g.files.len()).sum();
+    println!("\nSession {}: {} groups, {} duplicate files", session_id, total_groups, total_files);
+}
+
+fn cmd_list(db: &Database, session_id: Option<i64>) {
+    match session_id {
+        None => {
+            let sessions = db.list_scan_sessions().expect("Failed to list sessions");
+            if sessions.is_empty() {
+                println!("No scan sessions found.");
+                return;
+            }
+            println!("{:<6} {:<12} {:<22} {}", "ID", "Status", "Created", "Name");
+            println!("{}", "-".repeat(60));
+            for s in sessions {
+                println!("{:<6} {:<12} {:<22} {}", s.id, s.status, s.created_at, s.name);
+            }
+        }
+        Some(id) => {
+            let session = db.get_scan_session(id).expect("Session not found");
+            println!("Session {}: {} ({})", session.id, session.name, session.status);
+            println!("Created: {}", session.created_at);
+            println!("Threshold: {:.0}%", session.similarity_threshold * 100.0);
+            println!();
+
+            let groups = db.get_duplicate_groups(id).expect("Failed to get groups");
+            for group in &groups {
+                println!(
+                    "  Group {} [{}] - {:.1}% similar",
+                    group.id, group.file_type, group.similarity_score * 100.0
+                );
+                let files = db.get_file_entries(group.id).expect("Failed to get files");
+                for f in &files {
+                    println!(
+                        "    {} ({:.2} MB)",
+                        f.file_path,
+                        f.file_size as f64 / 1_048_576.0
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn cmd_export(db: &Database, session_id: i64, output: &PathBuf) {
+    let groups = db
+        .get_duplicate_groups(session_id)
+        .expect("Failed to get groups");
+
+    let mut csv = String::from("group_id,file_type,similarity,file_path,file_size_bytes,modified_time\n");
+
+    for group in &groups {
+        let files = db.get_file_entries(group.id).expect("Failed to get files");
+        for f in &files {
+            csv.push_str(&format!(
+                "{},{},{:.4},\"{}\",{},{}\n",
+                group.id,
+                group.file_type,
+                group.similarity_score,
+                f.file_path.replace('"', "\"\""),
+                f.file_size,
+                f.modified_time.as_deref().unwrap_or(""),
+            ));
+        }
+    }
+
+    std::fs::write(output, &csv).expect("Failed to write output file");
+    println!("Exported {} groups to {}", groups.len(), output.display());
+}
+
+/// Simple timestamp formatter (avoids chrono dependency).
+fn chrono_format_timestamp(secs: u64) -> String {
+    // Basic ISO-ish format: just return the unix timestamp as a string
+    // In a real app, you'd use chrono or time crate
+    format!("{}", secs)
+}

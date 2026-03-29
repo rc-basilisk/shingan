@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/shingan-core",
+    "crates/shingan-db",
+    "crates/shingan-utils",
+    "crates/shingan-cli",
+    "crates/shingan-gui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Core
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+lru = "0.12"
+walkdir = "2"
+rayon = "1"
+crossbeam-channel = "0.5"
+dirs = "6"
+mime_guess = "2"
+
+# Image processing
+image = "0.25"
+img_hash = "3"
+
+# Video processing
+ffmpeg-next = "7"
+vid_dup_finder_lib = "0.4"
+
+# Document processing
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+pdf-extract = "0.7"
+
+# Text similarity
+rapidfuzz = "0.5"
+strsim = "0.11"
+
+# Code syntax highlighting
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async / HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# GUI
+iced = { version = "0.13", features = ["image", "tokio"] }
+rfd = "0.15"
+
+# Internal crates
+shingan-core = { path = "crates/shingan-core" }
+shingan-db = { path = "crates/shingan-db" }
+shingan-utils = { path = "crates/shingan-utils" }
