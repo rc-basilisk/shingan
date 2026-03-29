@@ -154,6 +154,8 @@ impl App {
                     &results.selected_for_deletion,
                     &results.deletion_message,
                     &results.preview,
+                    results.page,
+                    results.page_size,
                 )
                 .map(Message::Finder);
             }
@@ -242,34 +244,62 @@ impl App {
         category: FileCategory,
         groups: &[shingan_core::scanner::grouping::DuplicateGroup],
     ) {
-        for group in groups {
-            let group_id = match self.db.insert_duplicate_group(
-                &shingan_db::models::NewDuplicateGroup {
-                    session_id,
-                    file_type: category.label(),
-                    similarity_score: group.similarity,
-                    hash_value: None,
-                },
-            ) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
+        struct OwnedEntry {
+            file_path: String,
+            file_size: i64,
+        }
+        struct OwnedGroup {
+            entries: Vec<OwnedEntry>,
+            similarity: f64,
+        }
 
-            for file_path in &group.files {
-                let meta = std::fs::metadata(file_path).ok();
-                let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+        let owned: Vec<OwnedGroup> = groups
+            .iter()
+            .map(|group| {
+                let entries: Vec<OwnedEntry> = group
+                    .files
+                    .iter()
+                    .map(|file_path| {
+                        let meta = std::fs::metadata(file_path).ok();
+                        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+                        OwnedEntry {
+                            file_path: file_path.to_string_lossy().into_owned(),
+                            file_size: size,
+                        }
+                    })
+                    .collect();
+                OwnedGroup {
+                    entries,
+                    similarity: group.similarity,
+                }
+            })
+            .collect();
 
-                self.db
-                    .insert_file_entry(&shingan_db::models::NewFileEntry {
-                        group_id,
-                        file_path: &file_path.to_string_lossy(),
-                        file_size: size,
+        let batch_refs: Vec<(&str, f64, Option<&str>, Vec<shingan_db::models::NewFileEntryBatch>)> = owned
+            .iter()
+            .map(|group| {
+                let entries: Vec<shingan_db::models::NewFileEntryBatch> = group
+                    .entries
+                    .iter()
+                    .map(|e| shingan_db::models::NewFileEntryBatch {
+                        file_path: &e.file_path,
+                        file_size: e.file_size,
                         modified_time: None,
                         thumbnail_path: None,
                         file_metadata: None,
                     })
-                    .ok();
-            }
+                    .collect();
+                (category.label(), group.similarity, None as Option<&str>, entries)
+            })
+            .collect();
+
+        let batch_slices: Vec<(&str, f64, Option<&str>, &[shingan_db::models::NewFileEntryBatch])> = batch_refs
+            .iter()
+            .map(|(ft, sim, hv, entries)| (*ft, *sim, hv.as_deref(), entries.as_slice()))
+            .collect();
+
+        if let Err(e) = self.db.insert_duplicate_groups_batch(session_id, &batch_slices) {
+            eprintln!("Failed to persist duplicate groups: {e}");
         }
     }
 }

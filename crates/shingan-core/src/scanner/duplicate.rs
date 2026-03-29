@@ -99,7 +99,7 @@ impl DuplicateScanner {
     ) -> Self {
         Self {
             detectors,
-            file_scanner: FileScanner::new(categories),
+            file_scanner: FileScanner::new(categories).with_size_limits(1024, None),
             control,
             similarity_threshold,
             progress_tx,
@@ -113,24 +113,32 @@ impl DuplicateScanner {
     /// Run the full 3-phase scan on the given paths.
     ///
     /// Each path is a (directory, include_subdirs) tuple.
-    pub fn scan_paths(&self, paths: &[(PathBuf, bool)]) -> HashMap<FileCategory, Vec<DuplicateGroup>> {
+    pub fn scan_paths(
+        &self,
+        paths: &[(PathBuf, bool)],
+    ) -> HashMap<FileCategory, Vec<DuplicateGroup>> {
         let mut all_results: HashMap<FileCategory, Vec<DuplicateGroup>> = HashMap::new();
 
-        // Phase 1: Discovery
         self.send(ScanProgress::Status(
             "Phase 1/3: Discovering files...".to_string(),
         ));
 
         let mut files_by_category: HashMap<FileCategory, Vec<FileInfo>> = HashMap::new();
+        let mut total_skipped_permission: u32 = 0;
+        let mut total_skipped_other: u32 = 0;
 
         for (path, include_subdirs) in paths {
             if self.control.is_stopped() {
                 return all_results;
             }
 
-            let files = self.file_scanner.scan_directory(path, *include_subdirs, None);
+            let result = self
+                .file_scanner
+                .scan_directory(path, *include_subdirs, None);
+            total_skipped_permission += result.skipped_permission;
+            total_skipped_other += result.skipped_other;
 
-            for file in files {
+            for file in result.files {
                 files_by_category
                     .entry(file.category)
                     .or_default()
@@ -139,10 +147,18 @@ impl DuplicateScanner {
         }
 
         let total_files: usize = files_by_category.values().map(|v| v.len()).sum();
-        self.send(ScanProgress::Status(format!(
-            "Phase 1/3: Found {} files",
-            total_files
-        )));
+        let skipped_total = total_skipped_permission + total_skipped_other;
+        if skipped_total > 0 {
+            self.send(ScanProgress::Status(format!(
+                "Phase 1/3: Found {} files ({} skipped: {} permission denied, {} other errors)",
+                total_files, skipped_total, total_skipped_permission, total_skipped_other
+            )));
+        } else {
+            self.send(ScanProgress::Status(format!(
+                "Phase 1/3: Found {} files",
+                total_files
+            )));
+        }
 
         // Phase 2: Analysis (per category)
         let categories: Vec<FileCategory> = files_by_category.keys().copied().collect();
@@ -203,7 +219,7 @@ impl DuplicateScanner {
 
                 // Progress reporting with atomic counter (monotonically increasing)
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 10 == 0 || done == file_count {
+                if done.is_multiple_of(10) || done == file_count {
                     let _ = self.progress_tx.send(ScanProgress::Progress {
                         current: done,
                         total: file_count,
@@ -236,7 +252,10 @@ impl DuplicateScanner {
         // Archives use exact matching only (SHA256 comparison).
         let category = detector.category();
         let all_groups = match category {
-            FileCategory::Image | FileCategory::Video | FileCategory::Document | FileCategory::Code => {
+            FileCategory::Image
+            | FileCategory::Video
+            | FileCategory::Document
+            | FileCategory::Code => {
                 let progress_tx = self.progress_tx.clone();
                 grouping::find_fuzzy_groups(
                     &file_signatures,
@@ -252,9 +271,7 @@ impl DuplicateScanner {
                     }),
                 )
             }
-            FileCategory::Archive => {
-                grouping::find_exact_groups(&file_signatures)
-            }
+            FileCategory::Archive => grouping::find_exact_groups(&file_signatures),
         };
 
         all_groups

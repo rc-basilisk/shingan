@@ -77,8 +77,9 @@ pub struct ResultsState {
     pub filter: Option<FileCategory>,
     pub show_results: bool,
     pub deletion_message: Option<String>,
-    /// File currently being previewed (full path + its category).
     pub preview: Option<PreviewFile>,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +125,10 @@ pub enum FinderMessage {
     ZoomReset,
     PdfNextPage,
     PdfPrevPage,
+    PageNext,
+    PagePrev,
+    PageFirst,
+    PageLast,
 }
 
 impl Default for DuplicateFinderState {
@@ -249,6 +254,8 @@ impl DuplicateFinderState {
                         show_results: false,
                         deletion_message: None,
                         preview: None,
+                        page: 0,
+                        page_size: 50,
                     });
                     results.groups.insert(category, groups);
                 }
@@ -300,6 +307,7 @@ impl DuplicateFinderState {
             FinderMessage::FilterChanged(filter) => {
                 if let Some(ref mut results) = self.results {
                     results.filter = filter;
+                    results.page = 0;
                 }
             }
             FinderMessage::ToggleFileForDeletion(path) => {
@@ -559,6 +567,49 @@ impl DuplicateFinderState {
                     }
                 }
             }
+            FinderMessage::PageNext => {
+                if let Some(ref mut results) = self.results {
+                    let total: usize = results
+                        .groups
+                        .iter()
+                        .filter(|(c, _)| results.filter.is_none_or(|f| *c == &f))
+                        .map(|(_, g)| g.len())
+                        .sum();
+                    let last_page = if results.page_size > 0 {
+                        total.saturating_sub(1) / results.page_size
+                    } else {
+                        0
+                    };
+                    if results.page < last_page {
+                        results.page += 1;
+                    }
+                }
+            }
+            FinderMessage::PagePrev => {
+                if let Some(ref mut results) = self.results {
+                    results.page = results.page.saturating_sub(1);
+                }
+            }
+            FinderMessage::PageFirst => {
+                if let Some(ref mut results) = self.results {
+                    results.page = 0;
+                }
+            }
+            FinderMessage::PageLast => {
+                if let Some(ref mut results) = self.results {
+                    let total: usize = results
+                        .groups
+                        .iter()
+                        .filter(|(c, _)| results.filter.is_none_or(|f| *c == &f))
+                        .map(|(_, g)| g.len())
+                        .sum();
+                    results.page = if results.page_size > 0 {
+                        total.saturating_sub(1) / results.page_size
+                    } else {
+                        0
+                    };
+                }
+            }
         }
         Task::none()
     }
@@ -624,10 +675,10 @@ impl DuplicateFinderState {
                     start = start.on_press(FinderMessage::StartScan);
                 }
                 let mut r = row![start].spacing(10);
-                if matches!(self.scan_state, ScanState::Completed) {
-                    if self.results.is_some() {
-                        r = r.push(button("View Results").on_press(FinderMessage::ViewResults));
-                    }
+                if matches!(self.scan_state, ScanState::Completed)
+                    && self.results.is_some()
+                {
+                    r = r.push(button("View Results").on_press(FinderMessage::ViewResults));
                 }
                 r
             }

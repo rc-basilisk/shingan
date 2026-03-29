@@ -1,25 +1,14 @@
 use crate::detector::Detector;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// A group of duplicate files with their similarity score.
 #[derive(Debug, Clone)]
 pub struct DuplicateGroup {
     pub files: Vec<PathBuf>,
     pub similarity: f64,
 }
 
-/// Result of the grouping phase.
-pub struct GroupingResult {
-    pub exact_groups: Vec<DuplicateGroup>,
-    pub fuzzy_groups: Vec<DuplicateGroup>,
-}
-
-/// Find exact duplicate groups (identical signatures).
-pub fn find_exact_groups(
-    file_signatures: &HashMap<PathBuf, String>,
-) -> Vec<DuplicateGroup> {
-    // Group files by identical signature
+pub fn find_exact_groups(file_signatures: &HashMap<PathBuf, String>) -> Vec<DuplicateGroup> {
     let mut sig_to_files: HashMap<&str, Vec<PathBuf>> = HashMap::new();
     for (path, sig) in file_signatures {
         sig_to_files
@@ -38,10 +27,46 @@ pub fn find_exact_groups(
         .collect()
 }
 
-/// Find fuzzy duplicate groups using prefix-based locality-sensitive hashing.
-///
-/// Uses strict group membership: a file pair only joins an existing group if
-/// BOTH files match ALL existing group members above the threshold.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u32>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]);
+            self.parent[x]
+        } else {
+            x
+        }
+    }
+
+    fn union(&mut self, a: usize, b: usize) -> bool {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return false;
+        }
+        if self.rank[ra] < self.rank[rb] {
+            self.parent[ra] = rb;
+        } else if self.rank[ra] > self.rank[rb] {
+            self.parent[rb] = ra;
+        } else {
+            self.parent[rb] = ra;
+            self.rank[ra] += 1;
+        }
+        true
+    }
+}
+
 pub fn find_fuzzy_groups(
     file_signatures: &HashMap<PathBuf, String>,
     detector: &dyn Detector,
@@ -49,99 +74,280 @@ pub fn find_fuzzy_groups(
     prefix_len: usize,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Vec<DuplicateGroup> {
-    // Build prefix groups for LSH
-    let mut prefix_groups: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
-    for (path, sig) in file_signatures {
+    let indexed: Vec<&PathBuf> = file_signatures.keys().collect();
+
+    let mut prefix_buckets: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, path) in indexed.iter().enumerate() {
+        let sig = &file_signatures[*path];
         let prefix = if sig.len() >= prefix_len {
             &sig[..prefix_len]
         } else {
             sig.as_str()
         };
-        prefix_groups
-            .entry(prefix.to_string())
-            .or_default()
-            .push((path.clone(), sig.clone()));
+        prefix_buckets.entry(prefix).or_default().push(i);
     }
 
-    // Calculate total comparisons for progress reporting
-    let total_comparisons: usize = prefix_groups
+    let total_comparisons: usize = prefix_buckets
         .values()
-        .map(|group| group.len() * (group.len().saturating_sub(1)) / 2)
+        .map(|b| b.len() * (b.len().saturating_sub(1)) / 2)
         .sum();
 
-    let mut groups: Vec<DuplicateGroup> = Vec::new();
-    let mut processed_pairs: std::collections::HashSet<(PathBuf, PathBuf)> = Default::default();
+    let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
+    let mut similar_pairs: Vec<(usize, usize, f64)> = Vec::new();
     let mut comparisons_done: usize = 0;
 
-    for prefix_group in prefix_groups.values() {
-        if prefix_group.len() < 2 {
+    for bucket in prefix_buckets.values() {
+        if bucket.len() < 2 {
             continue;
         }
-
-        for i in 0..prefix_group.len() {
-            for j in (i + 1)..prefix_group.len() {
-                let (path1, sig1) = &prefix_group[i];
-                let (path2, sig2) = &prefix_group[j];
-
-                // Deduplicate pairs
-                let pair = if path1 < path2 {
-                    (path1.clone(), path2.clone())
+        for i in 0..bucket.len() {
+            for j in (i + 1)..bucket.len() {
+                let (a, b) = if bucket[i] < bucket[j] {
+                    (bucket[i], bucket[j])
                 } else {
-                    (path2.clone(), path1.clone())
+                    (bucket[j], bucket[i])
                 };
-                if processed_pairs.contains(&pair) {
+                if !seen_pairs.insert((a, b)) {
                     comparisons_done += 1;
                     continue;
                 }
-                processed_pairs.insert(pair);
 
-                let similarity = detector.compare_signatures(sig1, sig2);
+                let sig_a = &file_signatures[indexed[a]];
+                let sig_b = &file_signatures[indexed[b]];
+                let similarity = detector.compare_signatures(sig_a, sig_b);
                 comparisons_done += 1;
 
                 if let Some(cb) = progress {
-                    if comparisons_done % 100 == 0 {
+                    if comparisons_done.is_multiple_of(100) {
                         cb(comparisons_done, total_comparisons);
                     }
                 }
 
-                if similarity < threshold {
-                    continue;
-                }
-
-                // Strict group membership: find a group where BOTH files match
-                // all existing members
-                let mut found_group = false;
-                for group in groups.iter_mut() {
-                    let both_match = group.files.iter().all(|existing| {
-                        let existing_sig = file_signatures.get(existing).unwrap();
-                        let sim1 = detector.compare_signatures(sig1, existing_sig);
-                        let sim2 = detector.compare_signatures(sig2, existing_sig);
-                        sim1 >= threshold && sim2 >= threshold
-                    });
-
-                    if both_match {
-                        if !group.files.contains(path1) {
-                            group.files.push(path1.clone());
-                        }
-                        if !group.files.contains(path2) {
-                            group.files.push(path2.clone());
-                        }
-                        // Update similarity to minimum
-                        group.similarity = group.similarity.min(similarity);
-                        found_group = true;
-                        break;
-                    }
-                }
-
-                if !found_group {
-                    groups.push(DuplicateGroup {
-                        files: vec![path1.clone(), path2.clone()],
-                        similarity,
-                    });
+                if similarity >= threshold {
+                    similar_pairs.push((a, b, similarity));
                 }
             }
         }
     }
 
-    groups
+    similar_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = indexed.len();
+    let mut uf = UnionFind::new(n);
+    // Maintain root -> members map incrementally to avoid O(n) scans per pair
+    let mut root_members: HashMap<usize, Vec<usize>> = (0..n).map(|i| (i, vec![i])).collect();
+
+    for (a, b, _sim) in &similar_pairs {
+        let ra = uf.find(*a);
+        let rb = uf.find(*b);
+        if ra == rb {
+            continue;
+        }
+
+        let set_a = &root_members[&ra];
+        let set_b = &root_members[&rb];
+
+        let mut all_similar = true;
+        'outer: for &member_a in set_a {
+            let sig_ma = &file_signatures[indexed[member_a]];
+            for &member_b in set_b {
+                let sig_mb = &file_signatures[indexed[member_b]];
+                if detector.compare_signatures(sig_ma, sig_mb) < threshold {
+                    all_similar = false;
+                    break 'outer;
+                }
+            }
+        }
+
+        if all_similar {
+            // Merge the smaller set into the larger one in the members map
+            let (keep_root, merge_root) = if root_members[&ra].len() >= root_members[&rb].len() {
+                (ra, rb)
+            } else {
+                (rb, ra)
+            };
+            uf.union(*a, *b);
+            let new_root = uf.find(*a);
+            let merged = root_members.remove(&merge_root).unwrap();
+            let keep = root_members.remove(&keep_root).unwrap();
+            let mut combined = keep;
+            combined.extend(merged);
+            root_members.insert(new_root, combined);
+        }
+    }
+
+    root_members
+        .into_values()
+        .filter(|members| members.len() >= 2)
+        .map(|members| {
+            let files: Vec<PathBuf> = members.iter().map(|&i| indexed[i].clone()).collect();
+            let mut min_sim = f64::MAX;
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let sig_a = &file_signatures[indexed[members[i]]];
+                    let sig_b = &file_signatures[indexed[members[j]]];
+                    let sim = detector.compare_signatures(sig_a, sig_b);
+                    min_sim = min_sim.min(sim);
+                }
+            }
+            DuplicateGroup {
+                files,
+                similarity: min_sim,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detector::Detector;
+    use crate::error::Result;
+    use crate::file_info::FileCategory;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    struct MockDetector {
+        similarities: HashMap<(String, String), f64>,
+    }
+
+    impl MockDetector {
+        fn new() -> Self {
+            Self {
+                similarities: HashMap::new(),
+            }
+        }
+
+        fn set_similar(&mut self, sig_a: &str, sig_b: &str, sim: f64) {
+            self.similarities
+                .insert((sig_a.to_string(), sig_b.to_string()), sim);
+            self.similarities
+                .insert((sig_b.to_string(), sig_a.to_string()), sim);
+        }
+    }
+
+    impl Detector for MockDetector {
+        fn compute_signature(&self, _path: &Path) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn compare_signatures(&self, sig1: &str, sig2: &str) -> f64 {
+            if sig1 == sig2 {
+                return 1.0;
+            }
+            self.similarities
+                .get(&(sig1.to_string(), sig2.to_string()))
+                .copied()
+                .unwrap_or(0.0)
+        }
+
+        fn compare_files(&self, _file1: &Path, _file2: &Path) -> Result<f64> {
+            Ok(0.0)
+        }
+
+        fn category(&self) -> FileCategory {
+            FileCategory::Image
+        }
+        fn threshold(&self) -> f64 {
+            0.9
+        }
+    }
+
+    fn make_sigs(pairs: &[(&str, &str)]) -> HashMap<PathBuf, String> {
+        pairs
+            .iter()
+            .map(|(path, sig)| (PathBuf::from(path), sig.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let sigs = HashMap::new();
+        let detector = MockDetector::new();
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_single_file() {
+        let sigs = make_sigs(&[("a.png", "sig_a")]);
+        let detector = MockDetector::new();
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_two_identical_files() {
+        let sigs = make_sigs(&[("a.png", "sig_x"), ("b.png", "sig_x")]);
+        let detector = MockDetector::new();
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2);
+        assert!((groups[0].similarity - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_multiple_distinct_groups() {
+        let sigs = make_sigs(&[
+            ("a.png", "sig_a"),
+            ("b.png", "sig_b"),
+            ("c.png", "sig_c"),
+            ("d.png", "sig_d"),
+        ]);
+        let mut detector = MockDetector::new();
+        detector.set_similar("sig_a", "sig_b", 0.95);
+        detector.set_similar("sig_c", "sig_d", 0.95);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        assert_eq!(groups.len(), 2);
+        for g in &groups {
+            assert_eq!(g.files.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_strict_membership() {
+        let sigs = make_sigs(&[("a.png", "sig_a"), ("b.png", "sig_b"), ("c.png", "sig_c")]);
+        let mut detector = MockDetector::new();
+        detector.set_similar("sig_a", "sig_b", 0.95);
+        detector.set_similar("sig_b", "sig_c", 0.95);
+        detector.set_similar("sig_a", "sig_c", 0.5);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 3, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2);
+        let paths: Vec<String> = groups[0]
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths.len(), 2);
+        let has_ab = paths.contains(&"a.png".to_string()) && paths.contains(&"b.png".to_string());
+        let has_bc = paths.contains(&"b.png".to_string()) && paths.contains(&"c.png".to_string());
+        assert!(has_ab || has_bc);
+    }
+
+    #[test]
+    fn test_below_threshold() {
+        let sigs = make_sigs(&[("a.png", "sig_a"), ("b.png", "sig_b")]);
+        let mut detector = MockDetector::new();
+        detector.set_similar("sig_a", "sig_b", 0.5);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_exact_groups() {
+        let sigs = make_sigs(&[
+            ("a.png", "hash1"),
+            ("b.png", "hash1"),
+            ("c.png", "hash2"),
+            ("d.png", "hash2"),
+            ("e.png", "hash3"),
+        ]);
+        let groups = find_exact_groups(&sigs);
+        assert_eq!(groups.len(), 2);
+        for g in &groups {
+            assert_eq!(g.files.len(), 2);
+            assert!((g.similarity - 1.0).abs() < f64::EPSILON);
+        }
+    }
 }

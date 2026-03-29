@@ -2,8 +2,8 @@ use crate::cache::BoundedCache;
 use crate::detector::Detector;
 use crate::error::Result;
 use crate::file_info::FileCategory;
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Code duplicate detector using normalization and fuzzy string matching.
 ///
@@ -26,7 +26,8 @@ impl CodeDetector {
     fn normalize_code(&self, path: &Path) -> Option<String> {
         let key = path.to_string_lossy().to_string();
 
-        if let Ok(mut cache) = self.cache.lock() {
+        {
+            let mut cache = self.cache.lock();
             if let Some(text) = cache.get(&key) {
                 return Some(text.clone());
             }
@@ -39,9 +40,7 @@ impl CodeDetector {
             .map(|line| line.trim())
             .filter(|line| !line.is_empty())
             .filter(|line| {
-                !line.starts_with('#')
-                    && !line.starts_with("//")
-                    && !line.starts_with("/*")
+                !line.starts_with('#') && !line.starts_with("//") && !line.starts_with("/*")
             })
             .collect();
 
@@ -51,7 +50,8 @@ impl CodeDetector {
 
         let result = normalized.join(" ");
 
-        if let Ok(mut cache) = self.cache.lock() {
+        {
+            let mut cache = self.cache.lock();
             cache.put(key, result.clone());
         }
 
@@ -91,9 +91,7 @@ impl Detector for CodeDetector {
         let text2 = self.normalize_code(file2);
 
         match (text1, text2) {
-            (Some(t1), Some(t2)) => {
-                Ok(strsim::sorensen_dice(&t1, &t2))
-            }
+            (Some(t1), Some(t2)) => Ok(strsim::sorensen_dice(&t1, &t2)),
             _ => Ok(0.0),
         }
     }
@@ -104,5 +102,17 @@ impl Detector for CodeDetector {
 
     fn threshold(&self) -> f64 {
         self.threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_missing_file() {
+        let det = CodeDetector::new(0.9);
+        let result = det.normalize_code(Path::new("/nonexistent/path/file.py"));
+        assert!(result.is_none());
     }
 }
