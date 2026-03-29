@@ -8,7 +8,7 @@ use shingan_core::detector::Detector;
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
 use shingan_db::Database;
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, row, text, Rule};
 use iced::{Element, Length, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -162,20 +162,27 @@ impl App {
         }
 
         let header = row![
-            text("Shingan — File Deduplicator & Organizer").size(22),
+            text("shingan")
+                .size(24)
+                .font(iced::Font::MONOSPACE),
+            text("— File Deduplicator & Organizer")
+                .size(16),
             iced::widget::horizontal_space(),
-            button(self.theme.toggle_label()).on_press(Message::ThemeToggled),
+            button(text(self.theme.toggle_label()).size(13))
+                .padding([4, 12])
+                .on_press(Message::ThemeToggled),
         ]
-        .spacing(10)
-        .padding(10);
+        .spacing(8)
+        .padding([12, 20])
+        .align_y(iced::Alignment::Center);
 
         let tab_bar = row![
             tab_button("Find Duplicates", Tab::DuplicateFinder, self.active_tab),
             tab_button("Auto-Sort Files", Tab::AutoSorter, self.active_tab),
             tab_button("Settings", Tab::Settings, self.active_tab),
         ]
-        .spacing(5)
-        .padding([0, 10]);
+        .spacing(4)
+        .padding([0, 20]);
 
         let tab_content: Element<Message> = match self.active_tab {
             Tab::DuplicateFinder => self.finder.view().map(Message::Finder),
@@ -183,10 +190,16 @@ impl App {
             Tab::Settings => self.settings.view().map(Message::Settings),
         };
 
-        let content = column![header, tab_bar, tab_content]
-            .spacing(5)
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let content = column![
+            header,
+            Rule::horizontal(1),
+            tab_bar,
+            Rule::horizontal(1),
+            tab_content,
+        ]
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         container(content)
             .width(Length::Fill)
@@ -313,7 +326,7 @@ impl App {
 }
 
 fn tab_button(label: &str, tab: Tab, active: Tab) -> Element<'_, Message> {
-    let btn = button(text(label).size(14));
+    let btn = button(text(label).size(14)).padding([8, 20]);
     if tab == active {
         btn.into()
     } else {

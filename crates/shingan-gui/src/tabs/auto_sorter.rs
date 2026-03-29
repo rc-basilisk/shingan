@@ -1,4 +1,4 @@
-use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, text, text_input, Rule};
 use iced::{Element, Length, Task};
 
 /// State for the Auto-Sorter tab.
@@ -103,58 +103,87 @@ impl AutoSorterState {
     }
 
     pub fn view(&self) -> Element<'_, SorterMessage> {
-        let mut content = column![].spacing(10).padding(20);
+        let mut content = column![].spacing(12).padding([16, 24]);
 
-        // Source folders
-        content = content.push(text("Source Folders").size(18));
+        // -- Source Folders --
+        content = content.push(text("Source Folders").size(16));
         for (i, path) in self.source_paths.iter().enumerate() {
             content = content.push(
-                row![
-                    text(path).width(Length::Fill),
-                    button("Remove").on_press(SorterMessage::RemoveSource(i)),
-                ]
-                .spacing(10),
+                container(
+                    row![
+                        text(path).size(13).width(Length::Fill),
+                        button(text("Remove").size(12))
+                            .padding([4, 10])
+                            .on_press(SorterMessage::RemoveSource(i)),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([6, 12]),
             );
         }
         content = content.push(button("Add Folder").on_press(SorterMessage::AddSource));
 
-        // Destination
-        content = content.push(text("Destination Folder").size(18));
+        // -- Destination --
+        content = content.push(Rule::horizontal(1));
+        content = content.push(text("Destination Folder").size(16));
         content = content.push(
             row![
                 text_input("Select destination folder...", &self.destination)
                     .on_input(SorterMessage::DestinationChanged)
                     .width(Length::Fill),
-                button("Browse").on_press(SorterMessage::SelectDestination),
+                button(text("Browse").size(13))
+                    .padding([6, 14])
+                    .on_press(SorterMessage::SelectDestination),
             ]
             .spacing(10),
         );
 
-        // Options
+        // -- Options --
+        content = content.push(Rule::horizontal(1));
         content = content.push(
             checkbox("Sort images into sub-categories (local ML)", self.use_ml)
                 .on_toggle(SorterMessage::ToggleML),
         );
 
-        // Control
+        // -- Control --
+        content = content.push(Rule::horizontal(1));
         match &self.sort_state {
             SortState::Idle => {
-                let mut start = button("Start Sorting");
+                let mut start = button(text("Start Sorting").size(14)).padding([8, 24]);
                 if !self.source_paths.is_empty() && !self.destination.is_empty() {
                     start = start.on_press(SorterMessage::StartSorting);
                 }
                 content = content.push(start);
             }
             SortState::Running { progress, status } => {
-                content = content.push(progress_bar(0.0..=1.0, *progress).height(20));
-                content = content.push(text(status));
+                content = content.push(
+                    container(
+                        column![
+                            progress_bar(0.0..=1.0, *progress).height(20),
+                            text(status).size(13),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding([10, 0]),
+                );
             }
             SortState::Completed { moved, failed } => {
-                content = content.push(text(format!(
-                    "Sorting complete! {} files moved, {} failed",
-                    moved, failed
-                )));
-                content = content.push(button("Start Sorting").on_press(SorterMessage::StartSorting));
+                content = content.push(
+                    container(
+                        text(format!(
+                            "Sorting complete! {} files moved, {} failed",
+                            moved, failed
+                        ))
+                        .size(14),
+                    )
+                    .padding([10, 14]),
+                );
+                content = content.push(
+                    button(text("Start Sorting").size(14))
+                        .padding([8, 24])
+                        .on_press(SorterMessage::StartSorting),
+                );
             }
         }
 

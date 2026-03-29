@@ -1,7 +1,7 @@
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{ScanControl, ScanProgress};
 use shingan_core::scanner::grouping::DuplicateGroup;
-use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, slider, text};
+use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, slider, text, Rule};
 use iced::{Element, Length, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -647,18 +647,24 @@ impl DuplicateFinderState {
     }
 
     pub fn view(&self) -> Element<'_, FinderMessage> {
-        let mut content = column![].spacing(10).padding(20);
+        let mut content = column![].spacing(12).padding([16, 24]);
 
-        // Scan paths section
-        content = content.push(text("Scan Paths").size(18));
+        // -- Scan Paths --
+        content = content.push(text("Scan Paths").size(16));
 
         for (i, path) in self.paths.iter().enumerate() {
             content = content.push(
-                row![
-                    text(path).width(Length::Fill),
-                    button("Remove").on_press(FinderMessage::RemovePath(i)),
-                ]
-                .spacing(10),
+                container(
+                    row![
+                        text(path).size(13).width(Length::Fill),
+                        button(text("Remove").size(12))
+                            .padding([4, 10])
+                            .on_press(FinderMessage::RemovePath(i)),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([6, 12]),
             );
         }
 
@@ -668,11 +674,13 @@ impl DuplicateFinderState {
                 checkbox("Include subdirectories", self.include_subdirs)
                     .on_toggle(FinderMessage::ToggleSubdirs),
             ]
-            .spacing(10),
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
         );
 
-        // File types section
-        content = content.push(text("File Types").size(18));
+        // -- File Types --
+        content = content.push(Rule::horizontal(1));
+        content = content.push(text("File Types").size(16));
         content = content.push(
             row![
                 checkbox("Images", self.file_types.image)
@@ -689,7 +697,8 @@ impl DuplicateFinderState {
             .spacing(15),
         );
 
-        // Threshold slider
+        // -- Threshold --
+        content = content.push(Rule::horizontal(1));
         content = content.push(
             row![
                 text(format!("Similarity Threshold: {}%", self.threshold)),
@@ -699,10 +708,11 @@ impl DuplicateFinderState {
             .align_y(iced::Alignment::Center),
         );
 
-        // Control buttons
+        // -- Controls --
+        content = content.push(Rule::horizontal(1));
         let controls = match &self.scan_state {
             ScanState::Idle | ScanState::Completed => {
-                let mut start = button("Start Scan");
+                let mut start = button(text("Start Scan").size(14)).padding([8, 24]);
                 if !self.paths.is_empty() {
                     start = start.on_press(FinderMessage::StartScan);
                 }
@@ -710,28 +720,32 @@ impl DuplicateFinderState {
                 if matches!(self.scan_state, ScanState::Completed)
                     && self.results.is_some()
                 {
-                    r = r.push(button("View Results").on_press(FinderMessage::ViewResults));
+                    r = r.push(
+                        button(text("View Results").size(14))
+                            .padding([8, 24])
+                            .on_press(FinderMessage::ViewResults),
+                    );
                 }
                 r
             }
             ScanState::Running { .. } => {
                 row![
-                    button("Pause").on_press(FinderMessage::PauseScan),
-                    button("Stop").on_press(FinderMessage::StopScan),
+                    button(text("Pause").size(13)).padding([6, 16]).on_press(FinderMessage::PauseScan),
+                    button(text("Stop").size(13)).padding([6, 16]).on_press(FinderMessage::StopScan),
                 ]
                 .spacing(10)
             }
             ScanState::Paused { .. } => {
                 row![
-                    button("Resume").on_press(FinderMessage::ResumeScan),
-                    button("Stop").on_press(FinderMessage::StopScan),
+                    button(text("Resume").size(13)).padding([6, 16]).on_press(FinderMessage::ResumeScan),
+                    button(text("Stop").size(13)).padding([6, 16]).on_press(FinderMessage::StopScan),
                 ]
                 .spacing(10)
             }
         };
         content = content.push(controls);
 
-        // Progress
+        // -- Progress --
         match &self.scan_state {
             ScanState::Running {
                 progress,
@@ -745,19 +759,30 @@ impl DuplicateFinderState {
                 elapsed_secs,
                 eta_secs,
             } => {
-                content = content.push(progress_bar(0.0..=1.0, *progress).height(20));
-                let mut timing = format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
-                if let Some(eta) = eta_secs {
-                    timing.push_str(&format!(" | ETA: {}", format_duration(*eta)));
-                }
-                content = content.push(text(timing));
+                let progress_section = {
+                    let mut timing = format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
+                    if let Some(eta) = eta_secs {
+                        timing.push_str(&format!(" | ETA: {}", format_duration(*eta)));
+                    }
+                    container(
+                        column![
+                            progress_bar(0.0..=1.0, *progress).height(20),
+                            text(timing).size(13),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding([10, 0])
+                };
+                content = content.push(progress_section);
             }
             _ => {}
         }
 
-        // Status message (scan complete, no duplicates, etc.)
+        // -- Status message --
         if let Some(ref msg) = self.status_message {
-            content = content.push(text(msg).size(16));
+            content = content.push(
+                container(text(msg).size(14)).padding([8, 12]),
+            );
         }
 
         scrollable(container(content).width(Length::Fill)).into()

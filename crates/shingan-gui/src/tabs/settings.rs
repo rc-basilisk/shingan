@@ -1,4 +1,4 @@
-use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Rule};
 use iced::{Element, Length, Task};
 use std::path::PathBuf;
 
@@ -225,149 +225,185 @@ impl SettingsState {
     }
 
     pub fn view(&self) -> Element<'_, SettingsMessage> {
-        let mut content = column![].spacing(15).padding(20);
+        let label_width = 220;
+        let mut content = column![].spacing(16).padding([16, 24]);
 
-        // -- Performance --
-        content = content.push(text("Performance").size(18));
-        content = content.push(
-            row![
-                text("Scanner threads:").width(200),
-                text_input("4", &self.thread_count)
-                    .on_input(SettingsMessage::ThreadCountChanged)
-                    .width(100),
-            ]
-            .spacing(10),
-        );
-        content = content.push(
-            row![
-                text("Thumbnail cache size (MB):").width(200),
-                text_input("500", &self.cache_size_mb)
-                    .on_input(SettingsMessage::CacheSizeChanged)
-                    .width(100),
-            ]
-            .spacing(10),
-        );
-
-        // -- Local ML Categorization --
-        content = content.push(text("Local ML Categorization").size(18));
-        content = content.push(
-            row![
-                text("Confidence threshold (0-1):").width(200),
-                text_input("0.60", &self.confidence_threshold)
-                    .on_input(SettingsMessage::ConfidenceThresholdChanged)
-                    .width(100),
-            ]
-            .spacing(10),
-        );
-        content = content.push(
-            row![
-                text("Custom model path (optional):").width(200),
-                text_input("Leave empty for default", &self.ml_model_path)
-                    .on_input(SettingsMessage::MlModelPathChanged)
-                    .width(Length::Fill),
-            ]
-            .spacing(10),
-        );
-
-        // Model status & download
-        let status_text = match &self.model_status {
-            ModelStatus::Unknown => "Model status: unknown",
-            ModelStatus::Present => "Model status: found",
-            ModelStatus::Missing => "Model status: not found",
-            ModelStatus::Downloading => "Model status: downloading...",
-        };
-        content = content.push(
-            row![
-                text(status_text).width(250),
-                button("Check").on_press(SettingsMessage::CheckModelStatus),
-                button("Download Model").on_press(SettingsMessage::DownloadModel),
-            ]
-            .spacing(10),
-        );
-
-        // -- Cloud APIs (Advanced) --
-        content = content.push(text("Cloud APIs (Advanced)").size(18));
-        content = content.push(
-            checkbox("Enable cloud escalation for low-confidence images", self.cloud_enabled)
-                .on_toggle(SettingsMessage::ToggleCloud),
-        );
-
-        content = content.push(
-            row![
-                text("Cloud provider:").width(200),
-                pick_list(
-                    CloudProvider::ALL.as_slice(),
-                    Some(self.cloud_provider),
-                    SettingsMessage::CloudProviderSelected,
-                )
-                .width(200),
-            ]
-            .spacing(10),
-        );
-
-        // Provider-specific fields
-        if self.cloud_provider == CloudProvider::Ollama {
-            content = content.push(
-                row![
-                    text("Ollama API URL:").width(200),
-                    text_input("http://localhost:11434", &self.ollama_url)
-                        .on_input(SettingsMessage::OllamaUrlChanged)
-                        .width(Length::Fill),
+        // -- Performance card --
+        {
+            let card = container(
+                column![
+                    text("Performance").size(16),
+                    row![
+                        text("Scanner threads:").width(label_width),
+                        text_input("4", &self.thread_count)
+                            .on_input(SettingsMessage::ThreadCountChanged)
+                            .width(100),
+                    ]
+                    .spacing(10),
+                    row![
+                        text("Thumbnail cache size (MB):").width(label_width),
+                        text_input("500", &self.cache_size_mb)
+                            .on_input(SettingsMessage::CacheSizeChanged)
+                            .width(100),
+                    ]
+                    .spacing(10),
                 ]
                 .spacing(10),
-            );
-            content = content.push(
-                row![
-                    text("Vision model:").width(200),
-                    text_input("llava", &self.vision_model)
-                        .on_input(SettingsMessage::VisionModelChanged)
-                        .width(200),
-                ]
-                .spacing(10),
-            );
-        } else {
-            content = content.push(
-                row![
-                    text("API key:").width(200),
-                    text_input("Enter API key...", &self.cloud_api_key)
-                        .on_input(SettingsMessage::CloudApiKeyChanged)
-                        .width(Length::Fill)
-                        .secure(true),
-                ]
-                .spacing(10),
-            );
+            )
+            .padding(15)
+            .width(Length::Fill);
+            content = content.push(card);
         }
 
-        content = content.push(
-            row![
-                text("Max cloud requests/session:").width(200),
-                text_input("unlimited", &self.max_cloud_requests)
-                    .on_input(SettingsMessage::MaxCloudRequestsChanged)
-                    .width(100),
-            ]
-            .spacing(10),
-        );
+        content = content.push(Rule::horizontal(1));
 
-        // -- Database --
-        content = content.push(text("Database").size(18));
-        content = content.push(
-            row![
-                button("Clear Old Sessions").on_press(SettingsMessage::ClearSessions),
-                button("Optimize Database").on_press(SettingsMessage::OptimizeDb),
-            ]
-            .spacing(10),
-        );
+        // -- Local ML card --
+        {
+            let status_text = match &self.model_status {
+                ModelStatus::Unknown => "Model status: unknown",
+                ModelStatus::Present => "Model status: found",
+                ModelStatus::Missing => "Model status: not found",
+                ModelStatus::Downloading => "Model status: downloading...",
+            };
 
-        // -- Cache --
-        content = content.push(text("Cache").size(18));
-        content = content.push(button("Clear Thumbnail Cache").on_press(SettingsMessage::ClearCache));
+            let card = container(
+                column![
+                    text("Local ML Categorization").size(16),
+                    row![
+                        text("Confidence threshold (0-1):").width(label_width),
+                        text_input("0.60", &self.confidence_threshold)
+                            .on_input(SettingsMessage::ConfidenceThresholdChanged)
+                            .width(100),
+                    ]
+                    .spacing(10),
+                    row![
+                        text("Custom model path (optional):").width(label_width),
+                        text_input("Leave empty for default", &self.ml_model_path)
+                            .on_input(SettingsMessage::MlModelPathChanged)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(10),
+                    row![
+                        text(status_text).width(250),
+                        button(text("Check").size(12)).padding([4, 10]).on_press(SettingsMessage::CheckModelStatus),
+                        button(text("Download Model").size(12)).padding([4, 10]).on_press(SettingsMessage::DownloadModel),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .spacing(10),
+            )
+            .padding(15)
+            .width(Length::Fill);
+            content = content.push(card);
+        }
+
+        content = content.push(Rule::horizontal(1));
+
+        // -- Cloud APIs card --
+        {
+            let mut cloud_fields = column![
+                text("Cloud APIs (Advanced)").size(16),
+                checkbox("Enable cloud escalation for low-confidence images", self.cloud_enabled)
+                    .on_toggle(SettingsMessage::ToggleCloud),
+                row![
+                    text("Cloud provider:").width(label_width),
+                    pick_list(
+                        CloudProvider::ALL.as_slice(),
+                        Some(self.cloud_provider),
+                        SettingsMessage::CloudProviderSelected,
+                    )
+                    .width(200),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10);
+
+            if self.cloud_provider == CloudProvider::Ollama {
+                cloud_fields = cloud_fields.push(
+                    row![
+                        text("Ollama API URL:").width(label_width),
+                        text_input("http://localhost:11434", &self.ollama_url)
+                            .on_input(SettingsMessage::OllamaUrlChanged)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(10),
+                );
+                cloud_fields = cloud_fields.push(
+                    row![
+                        text("Vision model:").width(label_width),
+                        text_input("llava", &self.vision_model)
+                            .on_input(SettingsMessage::VisionModelChanged)
+                            .width(200),
+                    ]
+                    .spacing(10),
+                );
+            } else {
+                cloud_fields = cloud_fields.push(
+                    row![
+                        text("API key:").width(label_width),
+                        text_input("Enter API key...", &self.cloud_api_key)
+                            .on_input(SettingsMessage::CloudApiKeyChanged)
+                            .width(Length::Fill)
+                            .secure(true),
+                    ]
+                    .spacing(10),
+                );
+            }
+
+            cloud_fields = cloud_fields.push(
+                row![
+                    text("Max cloud requests/session:").width(label_width),
+                    text_input("unlimited", &self.max_cloud_requests)
+                        .on_input(SettingsMessage::MaxCloudRequestsChanged)
+                        .width(100),
+                ]
+                .spacing(10),
+            );
+
+            let card = container(cloud_fields).padding(15).width(Length::Fill);
+            content = content.push(card);
+        }
+
+        content = content.push(Rule::horizontal(1));
+
+        // -- Database & Cache card --
+        {
+            let card = container(
+                column![
+                    text("Database & Cache").size(16),
+                    row![
+                        button(text("Clear Old Sessions").size(13)).padding([6, 14]).on_press(SettingsMessage::ClearSessions),
+                        button(text("Optimize Database").size(13)).padding([6, 14]).on_press(SettingsMessage::OptimizeDb),
+                        button(text("Clear Thumbnail Cache").size(13)).padding([6, 14]).on_press(SettingsMessage::ClearCache),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(10),
+            )
+            .padding(15)
+            .width(Length::Fill);
+            content = content.push(card);
+        }
+
+        content = content.push(Rule::horizontal(1));
 
         // -- Save --
-        content = content.push(button("Save Settings").on_press(SettingsMessage::SaveSettings));
+        content = content.push(
+            container(
+                button(text("Save Settings").size(14))
+                    .padding([10, 0])
+                    .width(Length::Fill)
+                    .on_press(SettingsMessage::SaveSettings),
+            )
+            .padding([4, 0]),
+        );
 
         // -- Status --
         if let Some(ref msg) = self.status_message {
-            content = content.push(text(msg));
+            content = content.push(
+                container(text(msg).size(14)).padding([8, 12]),
+            );
         }
 
         scrollable(container(content).width(Length::Fill)).into()
