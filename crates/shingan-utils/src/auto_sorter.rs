@@ -13,6 +13,7 @@ pub struct AutoSorter {
     destination: PathBuf,
     extension_map: ExtensionMap,
     use_ml: bool,
+    pipeline_config: PipelineConfig,
 }
 
 /// Statistics returned after sorting completes.
@@ -31,11 +32,18 @@ impl AutoSorter {
             destination,
             extension_map: ExtensionMap::new(),
             use_ml: false,
+            pipeline_config: PipelineConfig::default(),
         }
     }
 
     pub fn with_ml(mut self, enable: bool) -> Self {
         self.use_ml = enable;
+        self
+    }
+
+    /// Set a custom pipeline configuration (thresholds, model dir).
+    pub fn with_pipeline_config(mut self, config: PipelineConfig) -> Self {
+        self.pipeline_config = config;
         self
     }
 
@@ -68,7 +76,7 @@ impl AutoSorter {
         }
 
         let mut pipeline = if self.use_ml {
-            Some(TieredPipeline::new(PipelineConfig::default()))
+            Some(TieredPipeline::new(self.pipeline_config.clone()))
         } else {
             None
         };
@@ -92,7 +100,7 @@ impl AutoSorter {
                 .unwrap_or_else(|| "others".to_string());
 
             let sub_folder = if self.use_ml && category == Some(FileCategory::Image) {
-                self.classify_image(file_path, &ext, &mut pipeline)
+                self.classify_image(file_path, &mut pipeline)
             } else {
                 None
             };
@@ -141,7 +149,6 @@ impl AutoSorter {
     fn classify_image(
         &self,
         path: &Path,
-        _ext: &str,
         pipeline: &mut Option<TieredPipeline>,
     ) -> Option<String> {
         let pipeline = pipeline.as_mut()?;

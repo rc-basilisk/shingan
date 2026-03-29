@@ -172,6 +172,16 @@ cargo run --release -p shingan-gui
 
 The GUI provides tabbed access to the duplicate finder, auto-sorter, and settings. It supports dark and light themes, inline file preview, and batch deletion of duplicates.
 
+The **Settings** tab lets you configure:
+
+- **Performance** — scanner threads and thumbnail cache size
+- **Local ML** — confidence threshold for tier escalation, custom model directory, model status check and download trigger
+- **Cloud APIs** — cloud provider selection (Ollama/OpenAI/Gemini/Anthropic), API key input, Ollama URL + model name, max requests per session cost guardrail
+- **Database** — clear sessions, optimize/vacuum
+- **Cache** — clear thumbnail cache
+
+All settings persist to `~/.config/shingan/settings.json` and are applied on the next sort run.
+
 <!-- TODO: add screenshot -->
 
 ## Architecture

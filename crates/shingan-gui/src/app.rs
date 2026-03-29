@@ -227,10 +227,17 @@ impl App {
             let dest = PathBuf::from(&self.sorter.destination);
             let use_ml = self.sorter.use_ml;
 
+            let settings = crate::tabs::settings::load_settings();
+            let pipeline_config = shingan_ml::PipelineConfig {
+                tier0_min_confidence: settings.classification_confidence_threshold,
+                model_dir: settings.ml_model_path.map(PathBuf::from),
+                ..shingan_ml::PipelineConfig::default()
+            };
+
             subs.push(
                 Subscription::run_with_id(
                     "sorter",
-                    sort_subscription(sources, dest, use_ml),
+                    sort_subscription(sources, dest, use_ml, pipeline_config),
                 )
                 .map(Message::Sorter),
             );
@@ -532,6 +539,7 @@ fn sort_subscription(
     sources: Vec<PathBuf>,
     destination: PathBuf,
     use_ml: bool,
+    pipeline_config: shingan_ml::PipelineConfig,
 ) -> impl futures::Stream<Item = SorterMessage> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
@@ -542,7 +550,8 @@ fn sort_subscription(
         tokio::task::spawn_blocking(move || {
             let sorter =
                 shingan_utils::auto_sorter::AutoSorter::new(sources, destination)
-                    .with_ml(use_ml);
+                    .with_ml(use_ml)
+                    .with_pipeline_config(pipeline_config);
             let stats = sorter.sort_files(
                 Some(&|current, total, filepath| {
                     let _ = tx.send(SorterMessage::SortProgress {
