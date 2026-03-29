@@ -6,20 +6,31 @@
 //! Each detector implements content-aware similarity comparison for a specific file
 //! category:
 //!
-//! - **Image** -- perceptual hashing (pHash) for visual similarity
-//! - **Video** -- 3-D DCT fingerprinting across sampled frames
+//! - **Image** -- multi-hash perceptual hashing (aHash + pHash + dHash) with a
+//!   10 000-entry parse cache for fast pairwise comparison
+//! - **Video** -- 3-D DCT fingerprinting across sampled frames with a 2 000-entry
+//!   parse cache
 //! - **Document** -- text extraction followed by Sorensen-Dice coefficient comparison
 //! - **Code** -- whitespace/comment normalization with fuzzy matching
 //! - **Archive** -- byte-level SHA-256 for exact-match deduplication
 //!
+//! All detector caches use `parking_lot::Mutex` for non-poisoning, low-contention
+//! locking.
+//!
+//! ## Scanning pipeline
+//!
 //! The [`scanner::duplicate::DuplicateScanner`] orchestrates the full scanning
 //! pipeline in three phases:
 //!
-//! 1. **Discovery** -- walk the requested directories and classify files by category.
+//! 1. **Discovery** -- walk the requested directories via [`scanner::FileScanner`],
+//!    classify files by category, apply configurable size limits
+//!    ([`scanner::FileScanner::with_size_limits`]), and track permission-denied /
+//!    I/O errors in [`scanner::ScanResult`].
 //! 2. **Fingerprinting** -- compute a signature for every discovered file using the
-//!    appropriate detector.
-//! 3. **Comparison** -- cluster files whose similarity exceeds the configured
-//!    threshold into duplicate groups.
+//!    appropriate detector (parallelized with rayon).
+//! 3. **Grouping** -- cluster files whose similarity exceeds the configured threshold
+//!    using LSH prefix bucketing and a union-find structure with strict cross-validation
+//!    (see [`scanner::grouping`]).
 //!
 //! ## Feature flags
 //!

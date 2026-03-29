@@ -24,22 +24,24 @@ shingan is a high-performance file deduplication toolkit written in Rust. It det
 ## Features
 
 - **Perceptual duplicate detection** -- finds near-duplicates, not just byte-identical copies
-- **3-phase scanning** -- file discovery, parallel signature analysis, LSH-based fuzzy grouping
+- **3-phase scanning** -- file discovery, parallel signature analysis, union-find fuzzy grouping with strict membership validation
 - **5 detection engines** -- image, video, document, code, and archive, each with specialized algorithms
 - **Pluggable architecture** -- compile only the detectors you need via feature flags
-- **LRU caching** -- per-detector signature caches for fast rescans
+- **LRU caching** -- per-detector signature and parse caches (`parking_lot::Mutex`) for fast rescans and comparisons
+- **File size filtering** -- configurable min/max size limits with skip-count reporting
 - **Pause / resume / stop** -- full scan lifecycle control
-- **GUI with preview** -- image thumbnails, syntax-highlighted code, PDF pages, video frames
+- **GUI with preview** -- image thumbnails, syntax-highlighted code, PDF pages, video frames; paginated results (50 groups/page)
 - **Auto-sorter** -- rule-based file organization with optional Ollama-powered ML categorization
-- **SQLite persistence** -- WAL mode for concurrent access, full scan history
+- **SQLite persistence** -- WAL mode, indexed queries, batch inserts with transactions, full scan history
 - **CSV export** -- batch export results for external processing
+- **Robust error handling** -- `anyhow`-based CLI with contextual errors; permission-denied and I/O error tracking during scans
 
 ## Detection Capabilities
 
 | Category | Algorithm | Details |
 |----------|-----------|---------|
-| Image | Multi-hash perceptual (aHash + pHash + dHash) | 12x12 bit hashes via `img_hash`; all three must agree; 5000-entry LRU cache |
-| Video | 3D DCT perceptual (`vid_dup_finder_lib` + FFmpeg) | Samples first 20s, skips 3s intro; 1000-entry cache |
+| Image | Multi-hash perceptual (aHash + pHash + dHash) | 12x12 bit hashes via `img_hash`; all three must agree; 5000-entry signature cache + 10000-entry parse cache |
+| Video | 3D DCT perceptual (`vid_dup_finder_lib` + FFmpeg) | Samples first 20s, skips 3s intro; 1000-entry signature cache + 2000-entry parse cache |
 | Document | Text extraction + Sorensen-Dice coefficient | Supports PDF, DOCX, ODT, TXT, SRT, VTT, SUB, RTF |
 | Code | Normalization + Sorensen-Dice coefficient | Strips comments and whitespace; syntax-aware comparison |
 | Archive | SHA-256 exact match | Byte-for-byte content comparison |
@@ -128,10 +130,12 @@ shingan is organized as a Cargo workspace with five crates:
 ### Key design decisions
 
 - **Pluggable `Detector` trait** -- each file category implements a common interface for signature computation and comparison, making it straightforward to add new detection strategies.
-- **LRU caches** -- each detector maintains its own bounded cache to avoid recomputing signatures for previously seen files.
+- **Two-tier LRU caching** -- each detector maintains a bounded signature cache, and image/video detectors add a second parse cache to avoid re-deserializing signatures during pairwise comparisons. All caches use `parking_lot::Mutex` for non-poisoning, low-contention locking.
+- **Union-find grouping** -- duplicate candidates are clustered using LSH prefix bucketing, then merged via a union-find structure with path compression and union-by-rank. An incrementally maintained member map avoids O(n) scans per merge. Strict cross-validation before each merge ensures every file in a group is similar to every other file.
 - **rayon** -- signature computation is parallelized across available cores.
 - **crossbeam-channel** -- progress updates flow from worker threads to the UI without blocking.
-- **LSH-based grouping** -- duplicate candidates are clustered using locality-sensitive hashing with strict membership validation to prevent false positives from inflating groups.
+- **Batch DB inserts** -- duplicate groups are persisted in a single SQLite transaction, reducing lock contention and improving write throughput.
+- **Indexed queries** -- `file_path` and `created_at` columns are indexed for fast lookups and session listing.
 
 ## License
 
