@@ -65,7 +65,7 @@ shingan is a high-performance file deduplication toolkit written in Rust. It det
 ### Build from source
 
 ```bash
-git clone https://github.com/your-username/shingan.git
+git clone https://github.com/rc-basilisk/shingan.git
 cd shingan
 cargo build --release
 ```
@@ -135,13 +135,6 @@ shingan is organized as a Cargo workspace with five crates:
 
 ## License
 
-Licensed under either of
+This project is released into the public domain under [CC0 1.0 Universal](LICENSE).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+To the extent possible under law, the author has waived all copyright and related or neighboring rights to this work.
