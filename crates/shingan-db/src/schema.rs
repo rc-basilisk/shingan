@@ -16,14 +16,6 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             similarity_threshold REAL DEFAULT 0.95
         );
 
-        CREATE TABLE IF NOT EXISTS scanned_paths (
-            id INTEGER PRIMARY KEY,
-            session_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,
-            path TEXT NOT NULL,
-            include_subdirs INTEGER NOT NULL DEFAULT 1,
-            processed INTEGER NOT NULL DEFAULT 0
-        );
-
         CREATE TABLE IF NOT EXISTS duplicate_groups (
             id INTEGER PRIMARY KEY,
             session_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,
@@ -46,6 +38,8 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_file_entries_group_id
             ON file_entries(group_id);
+        CREATE INDEX IF NOT EXISTS idx_file_entries_file_path ON file_entries(file_path);
+        CREATE INDEX IF NOT EXISTS idx_scan_sessions_created_at ON scan_sessions(created_at);
 
         CREATE TABLE IF NOT EXISTS sorting_sessions (
             id INTEGER PRIMARY KEY,

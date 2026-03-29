@@ -1,11 +1,11 @@
 use crate::tabs::duplicate_finder::{video_thumbnail_path, FinderMessage, PreviewFile};
 use crate::views::file_preview::format_size;
-use shingan_core::file_info::FileCategory;
-use shingan_core::scanner::grouping::DuplicateGroup;
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, image, rich_text, row, scrollable, text,
 };
 use iced::{Color, Element, Length};
+use shingan_core::file_info::FileCategory;
+use shingan_core::scanner::grouping::DuplicateGroup;
 use std::collections::HashMap;
 use std::path::Path;
 use syntect::highlighting::ThemeSet;
@@ -20,11 +20,13 @@ pub fn view<'a>(
     selected: &std::collections::HashSet<String>,
     deletion_message: &'a Option<String>,
     preview: &'a Option<PreviewFile>,
+    page: usize,
+    page_size: usize,
 ) -> Element<'a, FinderMessage> {
     if let Some(pf) = preview {
         return render_preview_modal(pf);
     }
-    render_results_list(groups, filter, selected, deletion_message)
+    render_results_list(groups, filter, selected, deletion_message, page, page_size)
 }
 
 // ── Results list ────────────────────────────────────────────
@@ -34,6 +36,8 @@ fn render_results_list<'a>(
     filter: &Option<FileCategory>,
     selected: &std::collections::HashSet<String>,
     deletion_message: &'a Option<String>,
+    page: usize,
+    page_size: usize,
 ) -> Element<'a, FinderMessage> {
     let mut content = column![].spacing(12).padding(16);
 
@@ -59,7 +63,6 @@ fn render_results_list<'a>(
     );
     content = content.push(horizontal_rule(1));
 
-    // Filter buttons
     let filters: Vec<(Option<FileCategory>, &str)> = vec![
         (None, "All"),
         (Some(FileCategory::Image), "Images"),
@@ -80,7 +83,6 @@ fn render_results_list<'a>(
     }
     content = content.push(filter_row);
 
-    // Selection strategy buttons
     content = content.push(
         row![
             button(text("Select All").size(13)).on_press(FinderMessage::SelectAll),
@@ -95,24 +97,72 @@ fn render_results_list<'a>(
         content = content.push(container(text(msg.as_str()).size(14)).padding(8));
     }
 
-    // Groups
+    let visible: Vec<(FileCategory, &DuplicateGroup)> = groups
+        .iter()
+        .filter(|(c, _)| filter.is_none_or(|f| *c == &f))
+        .flat_map(|(cat, grp)| grp.iter().map(move |g| (*cat, g)))
+        .collect();
+
+    let total_visible = visible.len();
+    let last_page = if page_size > 0 {
+        total_visible.saturating_sub(1) / page_size
+    } else {
+        0
+    };
+    let current_page = page.min(last_page);
+    let page_items = visible
+        .into_iter()
+        .skip(current_page * page_size)
+        .take(page_size);
+
     let mut groups_content = column![].spacing(16);
-    let mut group_index = 0u32;
-    for (category, cat_groups) in groups {
-        if let Some(f) = filter {
-            if category != f {
-                continue;
-            }
-        }
-        for group in cat_groups {
-            group_index += 1;
-            groups_content =
-                groups_content.push(render_group(group_index, *category, group, selected));
-        }
+    let mut group_index = (current_page * page_size) as u32;
+    for (category, group) in page_items {
+        group_index += 1;
+        groups_content = groups_content.push(render_group(group_index, category, group, selected));
     }
     content = content.push(scrollable(groups_content).height(Length::Fill));
 
-    // Action bar
+    let first_btn = if current_page > 0 {
+        button(text("First").size(13)).on_press(FinderMessage::PageFirst)
+    } else {
+        button(text("First").size(13)).style(button::secondary)
+    };
+    let prev_btn = if current_page > 0 {
+        button(text("Prev").size(13)).on_press(FinderMessage::PagePrev)
+    } else {
+        button(text("Prev").size(13)).style(button::secondary)
+    };
+    let next_btn = if current_page < last_page {
+        button(text("Next").size(13)).on_press(FinderMessage::PageNext)
+    } else {
+        button(text("Next").size(13)).style(button::secondary)
+    };
+    let last_btn = if current_page < last_page {
+        button(text("Last").size(13)).on_press(FinderMessage::PageLast)
+    } else {
+        button(text("Last").size(13)).style(button::secondary)
+    };
+    let page_label = format!(
+        "Page {} of {} ({} total groups)",
+        current_page + 1,
+        last_page + 1,
+        total_visible,
+    );
+
+    content = content.push(horizontal_rule(1));
+    content = content.push(
+        row![
+            first_btn,
+            prev_btn,
+            text(page_label).size(13),
+            next_btn,
+            last_btn
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    );
+
     content = content.push(horizontal_rule(1));
     let delete_btn = if !selected.is_empty() {
         button(text("Delete Selected").size(14))
@@ -214,9 +264,7 @@ fn file_type_icon(category: FileCategory, ext: &str) -> (String, Color) {
         FileCategory::Archive => {
             let (icon, color) = match ext {
                 "zip" => ("ZIP", Color::from_rgb(0.9, 0.7, 0.2)),
-                "tar" | "gz" | "bz2" | "xz" | "zst" => {
-                    ("TAR", Color::from_rgb(0.7, 0.5, 0.2))
-                }
+                "tar" | "gz" | "bz2" | "xz" | "zst" => ("TAR", Color::from_rgb(0.7, 0.5, 0.2)),
                 "7z" => ("7Z", Color::from_rgb(0.5, 0.7, 0.3)),
                 "rar" => ("RAR", Color::from_rgb(0.6, 0.3, 0.7)),
                 _ => ("ARC", Color::from_rgb(0.6, 0.6, 0.4)),
@@ -303,10 +351,7 @@ fn render_file_card<'a>(
         }
         _ => {
             let (icon, color) = file_type_icon(category, &ext);
-            let can_preview = matches!(
-                category,
-                FileCategory::Document | FileCategory::Code
-            );
+            let can_preview = matches!(category, FileCategory::Document | FileCategory::Code);
             let btn_content = column![
                 text(icon).size(22).color(color),
                 text(ext.to_uppercase()).size(10),
@@ -527,8 +572,10 @@ fn render_preview_modal<'a>(pf: &'a PreviewFile) -> Element<'a, FinderMessage> {
             };
 
             if pf.category == FileCategory::Code {
-                content =
-                    content.push(scrollable(render_syntax_highlighted(&text_content, file_path)).height(Length::Fill));
+                content = content.push(
+                    scrollable(render_syntax_highlighted(&text_content, file_path))
+                        .height(Length::Fill),
+                );
             } else {
                 content = content.push(
                     scrollable(
@@ -581,10 +628,14 @@ fn get_image_dimensions(path: &Path) -> Option<(u32, u32)> {
     // Try ffprobe for video frames/images
     let output = std::process::Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
             &path.to_string_lossy(),
         ])
         .output()
@@ -602,10 +653,7 @@ fn get_image_dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// Render code with syntax highlighting using syntect.
-fn render_syntax_highlighted<'a>(
-    code: &str,
-    file_path: &Path,
-) -> Element<'a, FinderMessage> {
+fn render_syntax_highlighted<'a>(code: &str, file_path: &Path) -> Element<'a, FinderMessage> {
     let ps = SyntaxSet::load_defaults_newlines();
     let ts = ThemeSet::load_defaults();
     let theme = &ts.themes["base16-ocean.dark"];

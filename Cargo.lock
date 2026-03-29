@@ -5174,6 +5174,7 @@ dependencies = [
 name = "shingan-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "crossbeam-channel",
  "serde_json",
@@ -5192,6 +5193,7 @@ dependencies = [
  "img_hash",
  "lru",
  "mime_guess",
+ "parking_lot 0.12.5",
  "pdf-extract",
  "quick-xml 0.37.5",
  "rapidfuzz",
@@ -5200,6 +5202,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "strsim",
+ "tempfile",
  "thiserror 2.0.18",
  "vid_dup_finder_lib",
  "walkdir",
@@ -5214,6 +5217,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

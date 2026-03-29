@@ -1,8 +1,9 @@
 use iced::Theme;
 
 /// App theme state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum AppTheme {
+    #[default]
     Dark,
     Light,
 }
@@ -27,11 +28,5 @@ impl AppTheme {
             Self::Dark => "Light Mode",
             Self::Light => "Dark Mode",
         }
-    }
-}
-
-impl Default for AppTheme {
-    fn default() -> Self {
-        Self::Dark
     }
 }

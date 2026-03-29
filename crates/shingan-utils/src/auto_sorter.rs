@@ -72,7 +72,7 @@ impl AutoSorter {
                 .unwrap_or_else(|| "others".to_string());
 
             let dest_dir = self.destination.join(&category_name);
-            if let Err(_) = std::fs::create_dir_all(&dest_dir) {
+            if std::fs::create_dir_all(&dest_dir).is_err() {
                 stats.failed += 1;
                 continue;
             }

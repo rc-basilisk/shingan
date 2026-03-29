@@ -10,16 +10,6 @@ pub struct ScanSession {
     pub similarity_threshold: f64,
 }
 
-/// Row struct for scanned_paths table.
-#[derive(Debug, Clone)]
-pub struct ScannedPath {
-    pub id: i64,
-    pub session_id: i64,
-    pub path: String,
-    pub include_subdirs: bool,
-    pub processed: bool,
-}
-
 /// Row struct for duplicate_groups table.
 #[derive(Debug, Clone)]
 pub struct DuplicateGroupRow {
@@ -67,6 +57,14 @@ pub struct NewDuplicateGroup<'a> {
 /// Data for creating a new file entry.
 pub struct NewFileEntry<'a> {
     pub group_id: i64,
+    pub file_path: &'a str,
+    pub file_size: i64,
+    pub modified_time: Option<&'a str>,
+    pub thumbnail_path: Option<&'a str>,
+    pub file_metadata: Option<&'a str>,
+}
+
+pub struct NewFileEntryBatch<'a> {
     pub file_path: &'a str,
     pub file_size: i64,
     pub modified_time: Option<&'a str>,

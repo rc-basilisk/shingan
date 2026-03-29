@@ -2,19 +2,16 @@ use crate::cache::BoundedCache;
 use crate::detector::Detector;
 use crate::error::{Error, Result};
 use crate::file_info::FileCategory;
-use img_hash::image as ih_image; // Use img_hash's re-exported image crate
+use img_hash::image as ih_image;
 use img_hash::{HashAlg, HasherConfig, ImageHash};
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::Mutex;
 
-/// Image duplicate detector using multi-hash perceptual hashing.
-///
-/// Computes three hash types (average, gradient/dhash, DCT/phash) and returns
-/// the minimum similarity across all three — requiring agreement from all methods.
 pub struct ImageDetector {
     threshold: f64,
     hash_size: u32,
     cache: Mutex<BoundedCache<String, String>>,
+    parse_cache: Mutex<BoundedCache<String, (ImageHash, ImageHash, ImageHash)>>,
 }
 
 impl ImageDetector {
@@ -23,6 +20,7 @@ impl ImageDetector {
             threshold,
             hash_size,
             cache: Mutex::new(BoundedCache::new(5000)),
+            parse_cache: Mutex::new(BoundedCache::new(10000)),
         }
     }
 
@@ -50,14 +48,33 @@ impl ImageDetector {
         let dhash = ImageHash::from_base64(parts[2]).ok()?;
         Some((ahash, phash, dhash))
     }
+
+    fn get_or_parse(&self, sig: &str) -> Option<(ImageHash, ImageHash, ImageHash)> {
+        let key = sig.to_string();
+        {
+            let mut cache = self.parse_cache.lock();
+            if let Some(cached) = cache.get(&key) {
+                return Some(cached.clone());
+            }
+        }
+
+        let parsed = Self::parse_signature(sig)?;
+
+        {
+            let mut cache = self.parse_cache.lock();
+            cache.put(key, parsed.clone());
+        }
+
+        Some(parsed)
+    }
 }
 
 impl Detector for ImageDetector {
     fn compute_signature(&self, path: &Path) -> Result<Option<String>> {
         let key = path.to_string_lossy().to_string();
 
-        // Check cache
-        if let Ok(mut cache) = self.cache.lock() {
+        {
+            let mut cache = self.cache.lock();
             if let Some(sig) = cache.get(&key) {
                 return Ok(Some(sig.clone()));
             }
@@ -83,7 +100,8 @@ impl Detector for ImageDetector {
             dhash.to_base64()
         );
 
-        if let Ok(mut cache) = self.cache.lock() {
+        {
+            let mut cache = self.cache.lock();
             cache.put(key, sig.clone());
         }
 
@@ -91,11 +109,11 @@ impl Detector for ImageDetector {
     }
 
     fn compare_signatures(&self, sig1: &str, sig2: &str) -> f64 {
-        let (ahash1, phash1, dhash1) = match Self::parse_signature(sig1) {
+        let (ahash1, phash1, dhash1) = match self.get_or_parse(sig1) {
             Some(h) => h,
             None => return 0.0,
         };
-        let (ahash2, phash2, dhash2) = match Self::parse_signature(sig2) {
+        let (ahash2, phash2, dhash2) = match self.get_or_parse(sig2) {
             Some(h) => h,
             None => return 0.0,
         };
@@ -110,7 +128,6 @@ impl Detector for ImageDetector {
         let p_sim = 1.0 - (p_dist / max_dist);
         let d_sim = 1.0 - (d_dist / max_dist);
 
-        // Return minimum — all hashes must agree
         a_sim.min(p_sim).min(d_sim)
     }
 
@@ -129,5 +146,42 @@ impl Detector for ImageDetector {
 
     fn threshold(&self) -> f64 {
         self.threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_signature() {
+        let img = ih_image::RgbImage::from_pixel(8, 8, ih_image::Rgb([0u8; 3]));
+        let hasher = HasherConfig::new()
+            .hash_size(8, 8)
+            .hash_alg(HashAlg::Mean)
+            .to_hasher();
+        let h1 = hasher.hash_image(&img);
+        let hasher = HasherConfig::new()
+            .hash_size(8, 8)
+            .hash_alg(HashAlg::Blockhash)
+            .to_hasher();
+        let h2 = hasher.hash_image(&img);
+        let hasher = HasherConfig::new()
+            .hash_size(8, 8)
+            .hash_alg(HashAlg::Gradient)
+            .to_hasher();
+        let h3 = hasher.hash_image(&img);
+
+        let sig = format!("{}|{}|{}", h1.to_base64(), h2.to_base64(), h3.to_base64());
+
+        let result = ImageDetector::parse_signature(&sig);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_invalid_signature() {
+        assert!(ImageDetector::parse_signature("not_valid_base64!!!").is_none());
+        assert!(ImageDetector::parse_signature("only_one_part").is_none());
+        assert!(ImageDetector::parse_signature("").is_none());
     }
 }

@@ -2,9 +2,9 @@ use crate::cache::BoundedCache;
 use crate::detector::Detector;
 use crate::error::Result;
 use crate::file_info::FileCategory;
+use parking_lot::Mutex;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Document duplicate detector using text extraction and fuzzy matching.
 ///
@@ -27,7 +27,8 @@ impl DocumentDetector {
     fn extract_text(&self, path: &Path) -> Option<String> {
         let key = path.to_string_lossy().to_string();
 
-        if let Ok(mut cache) = self.cache.lock() {
+        {
+            let mut cache = self.cache.lock();
             if let Some(text) = cache.get(&key) {
                 return Some(text.clone());
             }
@@ -43,13 +44,13 @@ impl DocumentDetector {
         };
 
         if let Some(ref text) = text {
-            // Normalize whitespace
             let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
             if normalized.len() < 10 {
                 return None;
             }
 
-            if let Ok(mut cache) = self.cache.lock() {
+            {
+                let mut cache = self.cache.lock();
                 cache.put(key, normalized.clone());
             }
             return Some(normalized);
@@ -88,7 +89,8 @@ impl DocumentDetector {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Start(ref e)) | Ok(quick_xml::events::Event::Empty(ref e)) => {
+                Ok(quick_xml::events::Event::Start(ref e))
+                | Ok(quick_xml::events::Event::Empty(ref e)) => {
                     if e.local_name().as_ref() == b"t" {
                         in_wt = true;
                     }
@@ -200,9 +202,7 @@ impl Detector for DocumentDetector {
         let text2 = self.extract_text(file2);
 
         match (text1, text2) {
-            (Some(t1), Some(t2)) => {
-                Ok(strsim::sorensen_dice(&t1, &t2))
-            }
+            (Some(t1), Some(t2)) => Ok(strsim::sorensen_dice(&t1, &t2)),
             _ => Ok(0.0),
         }
     }
@@ -213,5 +213,18 @@ impl Detector for DocumentDetector {
 
     fn threshold(&self) -> f64 {
         self.threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_signature_missing_file() {
+        let det = DocumentDetector::new(0.9);
+        let result = det.compute_signature(Path::new("/nonexistent/path/file.txt"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

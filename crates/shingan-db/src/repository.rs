@@ -28,19 +28,29 @@ impl Database {
             None => default_db_path(),
         };
 
-        // Ensure parent directory exists
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+        if !db_path
+            .to_str()
+            .is_some_and(|s| s.starts_with(":memory:"))
+        {
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let conn = Connection::open(&db_path)?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            schema::initialize(&conn)?;
+            Ok(Self {
+                conn: Mutex::new(conn),
+                path: db_path,
+            })
+        } else {
+            let conn = Connection::open_in_memory()?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            schema::initialize(&conn)?;
+            Ok(Self {
+                conn: Mutex::new(conn),
+                path: db_path,
+            })
         }
-
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        schema::initialize(&conn)?;
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-            path: db_path,
-        })
     }
 
     fn with_conn<F, T>(&self, f: F) -> Result<T, DbError>
@@ -96,11 +106,7 @@ impl Database {
         })
     }
 
-    pub fn update_session_status(
-        &self,
-        session_id: i64,
-        status: &str,
-    ) -> Result<(), DbError> {
+    pub fn update_session_status(&self, session_id: i64, status: &str) -> Result<(), DbError> {
         self.with_conn(|conn| {
             if status == "completed" {
                 conn.execute(
@@ -203,6 +209,53 @@ impl Database {
         })
     }
 
+    pub fn insert_duplicate_groups_batch(
+        &self,
+        session_id: i64,
+        groups: &[(&str, f64, Option<&str>, &[NewFileEntryBatch])],
+    ) -> Result<Vec<i64>, DbError> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN TRANSACTION")?;
+            let mut ids = Vec::with_capacity(groups.len());
+            let result = (|| -> Result<(), DbError> {
+                for (file_type, similarity_score, hash_value, entries) in groups {
+                    conn.execute(
+                        "INSERT INTO duplicate_groups (session_id, file_type, similarity_score, hash_value)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![session_id, file_type, similarity_score, hash_value],
+                    )?;
+                    let group_id = conn.last_insert_rowid();
+                    ids.push(group_id);
+                    for entry in *entries {
+                        conn.execute(
+                            "INSERT INTO file_entries (group_id, file_path, file_size, modified_time, thumbnail_path, file_metadata)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                group_id,
+                                entry.file_path,
+                                entry.file_size,
+                                entry.modified_time,
+                                entry.thumbnail_path,
+                                entry.file_metadata,
+                            ],
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(ids)
+                }
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK").ok();
+                    Err(e)
+                }
+            }
+        })
+    }
+
     pub fn get_file_entries(&self, group_id: i64) -> Result<Vec<FileEntry>, DbError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -247,4 +300,167 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("shingan")
         .join("shingan.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::open(Some(Path::new(":memory:"))).unwrap()
+    }
+
+    #[test]
+    fn test_create_and_get_session() {
+        let db = test_db();
+        let id = db.create_scan_session("test", "image", 0.95).unwrap();
+        let session = db.get_scan_session(id).unwrap();
+        assert_eq!(session.name, "test");
+        assert_eq!(session.file_types, "image");
+        assert!((session.similarity_threshold - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_insert_and_get_groups() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let g = NewDuplicateGroup {
+            session_id: sid,
+            file_type: "image",
+            similarity_score: 0.98,
+            hash_value: None,
+        };
+        let gid = db.insert_duplicate_group(&g).unwrap();
+        let groups = db.get_duplicate_groups(sid).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, gid);
+        assert!((groups[0].similarity_score - 0.98).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_insert_and_get_file_entries() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let g = NewDuplicateGroup {
+            session_id: sid,
+            file_type: "image",
+            similarity_score: 0.95,
+            hash_value: None,
+        };
+        let gid = db.insert_duplicate_group(&g).unwrap();
+        let entry = NewFileEntry {
+            group_id: gid,
+            file_path: "/tmp/a.png",
+            file_size: 1024,
+            modified_time: None,
+            thumbnail_path: None,
+            file_metadata: None,
+        };
+        let eid = db.insert_file_entry(&entry).unwrap();
+        let entries = db.get_file_entries(gid).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, eid);
+        assert_eq!(entries[0].file_path, "/tmp/a.png");
+    }
+
+    #[test]
+    fn test_delete_file_entry() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let g = NewDuplicateGroup {
+            session_id: sid,
+            file_type: "image",
+            similarity_score: 0.95,
+            hash_value: None,
+        };
+        let gid = db.insert_duplicate_group(&g).unwrap();
+        let entry = NewFileEntry {
+            group_id: gid,
+            file_path: "/tmp/b.png",
+            file_size: 2048,
+            modified_time: None,
+            thumbnail_path: None,
+            file_metadata: None,
+        };
+        let eid = db.insert_file_entry(&entry).unwrap();
+        assert_eq!(db.get_file_entries(gid).unwrap().len(), 1);
+        db.delete_file_entry(eid).unwrap();
+        assert!(db.get_file_entries(gid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_batch_insert() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let entries1 = [
+            NewFileEntryBatch {
+                file_path: "/tmp/x.png",
+                file_size: 100,
+                modified_time: None,
+                thumbnail_path: None,
+                file_metadata: None,
+            },
+            NewFileEntryBatch {
+                file_path: "/tmp/y.png",
+                file_size: 200,
+                modified_time: None,
+                thumbnail_path: None,
+                file_metadata: None,
+            },
+        ];
+        let entries2 = [NewFileEntryBatch {
+            file_path: "/tmp/z.png",
+            file_size: 300,
+            modified_time: None,
+            thumbnail_path: None,
+            file_metadata: None,
+        }];
+        let groups: [(&str, f64, Option<&str>, &[NewFileEntryBatch]); 2] = [
+            ("image", 0.95, None, &entries1),
+            ("image", 0.90, None, &entries2),
+        ];
+        let ids = db.insert_duplicate_groups_batch(sid, &groups).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(db.get_file_entries(ids[0]).unwrap().len(), 2);
+        assert_eq!(db.get_file_entries(ids[1]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_vacuum() {
+        let db = test_db();
+        db.vacuum().unwrap();
+    }
+
+    #[test]
+    fn test_cascade_delete() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let g = NewDuplicateGroup {
+            session_id: sid,
+            file_type: "image",
+            similarity_score: 0.95,
+            hash_value: None,
+        };
+        let gid = db.insert_duplicate_group(&g).unwrap();
+        let entry = NewFileEntry {
+            group_id: gid,
+            file_path: "/tmp/c.png",
+            file_size: 512,
+            modified_time: None,
+            thumbnail_path: None,
+            file_metadata: None,
+        };
+        db.insert_file_entry(&entry).unwrap();
+        assert_eq!(db.get_file_entries(gid).unwrap().len(), 1);
+
+        db.with_conn(|conn| {
+            conn.execute("DELETE FROM scan_sessions WHERE id = ?1", params![sid])?;
+            Ok(())
+        })
+        .unwrap();
+
+        let groups = db.get_duplicate_groups(sid).unwrap();
+        assert!(groups.is_empty());
+        assert!(db.get_file_entries(gid).unwrap().is_empty());
+    }
 }
