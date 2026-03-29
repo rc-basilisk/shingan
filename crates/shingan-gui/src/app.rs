@@ -1,6 +1,6 @@
 use crate::tabs::auto_sorter::{AutoSorterState, SorterMessage};
 use crate::tabs::duplicate_finder::{DuplicateFinderState, FinderMessage, ScanState};
-use crate::tabs::settings::{SettingsMessage, SettingsState};
+use crate::tabs::settings::{DownloadState, SettingsMessage, SettingsState};
 use crate::theme::AppTheme;
 use crate::views::results_viewer;
 use shingan_core::detector::archive::ArchiveDetector;
@@ -229,6 +229,27 @@ impl App {
                         scan_subscription(paths, categories, threshold, control, self.db.clone()),
                     )
                     .map(|progress| Message::Finder(FinderMessage::ScanProgress(progress))),
+                );
+            }
+        }
+
+        // Model download subscription
+        if let DownloadState::Downloading { ref model_id, .. } = self.settings.download {
+            if let Some(model) = shingan_ml::model_registry::find_model(model_id) {
+                let files: Vec<(String, String)> = model
+                    .files
+                    .iter()
+                    .map(|f| (f.filename.to_string(), f.url.to_string()))
+                    .collect();
+                let target_dir =
+                    shingan_ml::model_registry::resolve_models_dir(&self.settings.ml_model_path);
+
+                subs.push(
+                    Subscription::run_with_id(
+                        "model-download",
+                        download_subscription(files, target_dir),
+                    )
+                    .map(Message::Settings),
                 );
             }
         }
@@ -546,6 +567,144 @@ fn persist_new_signatures(
             eprintln!("Failed to cache signatures: {e}");
         }
     }
+}
+
+/// Download model files with progress reporting.
+fn download_subscription(
+    files: Vec<(String, String)>, // (filename, url)
+    target_dir: PathBuf,
+) -> impl futures::Stream<Item = SettingsMessage> {
+    iced::stream::channel(100, move |mut output| async move {
+        use futures::SinkExt;
+
+        if let Err(e) = std::fs::create_dir_all(&target_dir) {
+            let _ = output
+                .send(SettingsMessage::DownloadComplete(Err(format!(
+                    "Failed to create directory: {}",
+                    e
+                ))))
+                .await;
+            return;
+        }
+
+        let client = reqwest::Client::new();
+        let file_count = files.len();
+
+        for (file_index, (filename, url)) in files.iter().enumerate() {
+            if url.is_empty() {
+                let _ = output
+                    .send(SettingsMessage::DownloadComplete(Err(format!(
+                        "No download URL configured for {}",
+                        filename
+                    ))))
+                    .await;
+                return;
+            }
+
+            // Send initial progress for this file.
+            let _ = output
+                .send(SettingsMessage::DownloadProgress {
+                    current_file: filename.clone(),
+                    file_index,
+                    file_count,
+                    downloaded: 0,
+                    total: 0,
+                })
+                .await;
+
+            let response = match client.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = output
+                        .send(SettingsMessage::DownloadComplete(Err(format!(
+                            "Failed to download {}: {}",
+                            filename, e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let _ = output
+                    .send(SettingsMessage::DownloadComplete(Err(format!(
+                        "{}: HTTP {}",
+                        filename,
+                        response.status()
+                    ))))
+                    .await;
+                return;
+            }
+
+            let total = response.content_length().unwrap_or(0);
+            let target_path = target_dir.join(filename);
+
+            let mut file = match std::fs::File::create(&target_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = output
+                        .send(SettingsMessage::DownloadComplete(Err(format!(
+                            "Failed to create {}: {}",
+                            filename, e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            let mut downloaded: u64 = 0;
+            let mut last_update = std::time::Instant::now();
+            let mut response = response;
+
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        use std::io::Write;
+                        if let Err(e) = file.write_all(&chunk) {
+                            let _ = output
+                                .send(SettingsMessage::DownloadComplete(Err(format!(
+                                    "Write error for {}: {}",
+                                    filename, e
+                                ))))
+                                .await;
+                            return;
+                        }
+                        downloaded += chunk.len() as u64;
+
+                        // Throttle progress updates to avoid flooding the UI.
+                        if last_update.elapsed() >= std::time::Duration::from_millis(150)
+                            || downloaded == total
+                        {
+                            let _ = output
+                                .send(SettingsMessage::DownloadProgress {
+                                    current_file: filename.clone(),
+                                    file_index,
+                                    file_count,
+                                    downloaded,
+                                    total,
+                                })
+                                .await;
+                            last_update = std::time::Instant::now();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = output
+                            .send(SettingsMessage::DownloadComplete(Err(format!(
+                                "Download error for {}: {}",
+                                filename, e
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        let _ = output
+            .send(SettingsMessage::DownloadComplete(Ok(())))
+            .await;
+    })
 }
 
 fn sort_subscription(

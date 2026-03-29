@@ -5,12 +5,13 @@
 //! prototype vectors (one per [`ImageSubCategory`]) using cosine similarity.
 //! The category with the highest similarity score is returned.
 //!
-//! Two model files are required (see [`crate::model_paths`]):
+//! One model file is required:
 //!
 //! - `clip_image.onnx` — the CLIP image encoder exported to ONNX format
-//! - `clip_prototypes.bin` — a flat binary file of `24 × embed_dim` float32
-//!   values (little-endian), where each row is the L2-normalized CLIP text
-//!   embedding for the corresponding [`ImageSubCategory::clip_prompt`]
+//!
+//! The category prototype vectors (`clip_prototypes.bin`) are embedded in the
+//! binary at compile time.  An on-disk file in the model directory is used if
+//! present (allows experimentation), otherwise the built-in copy is used.
 //!
 //! When the `onnx` feature is disabled, [`ClipOnnxClassifier`] becomes a
 //! zero-sized stub whose `try_load` always returns `Ok(None)`.
@@ -41,6 +42,10 @@ const CLIP_MEAN: [f32; 3] = [0.48145466, 0.45684515, 0.40821073];
 #[cfg(feature = "onnx")]
 const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
+/// Precomputed L2-normalised CLIP text embeddings for 24 categories (512-dim, LE f32).
+#[cfg(feature = "onnx")]
+const EMBEDDED_PROTOTYPES: &[u8] = include_bytes!("../data/clip_prototypes.bin");
+
 /// Loads when `clip_image.onnx` and `clip_prototypes.bin` exist and are consistent.
 #[cfg(feature = "onnx")]
 pub struct ClipOnnxClassifier {
@@ -52,15 +57,28 @@ pub struct ClipOnnxClassifier {
 #[cfg(feature = "onnx")]
 impl ClipOnnxClassifier {
     /// Try load from `model_dir` (defaults to [`crate::model_paths::default_models_dir`]).
+    ///
+    /// Only `clip_image.onnx` must be present on disk.  The prototype vectors
+    /// are loaded from an on-disk `clip_prototypes.bin` if it exists, otherwise
+    /// the compile-time embedded copy is used.
     pub fn try_load(model_dir: Option<&Path>) -> Result<Option<Self>, String> {
         let default_dir = crate::model_paths::default_models_dir();
         let dir = model_dir.unwrap_or(default_dir.as_path());
         let onnx_path = dir.join("clip_image.onnx");
-        let proto_path = dir.join("clip_prototypes.bin");
-        if !onnx_path.is_file() || !proto_path.is_file() {
+        if !onnx_path.is_file() {
             return Ok(None);
         }
-        let proto_bytes = std::fs::read(&proto_path).map_err(|e| e.to_string())?;
+
+        // Prefer on-disk prototypes (allows experimentation), fall back to embedded.
+        let proto_path = dir.join("clip_prototypes.bin");
+        let proto_bytes: &[u8] = if proto_path.is_file() {
+            // Leak a Vec so we get a &'static [u8] matching the embedded branch.
+            // This only happens once per classifier load, so the leak is negligible.
+            Box::leak(std::fs::read(&proto_path).map_err(|e| e.to_string())?.into_boxed_slice())
+        } else {
+            EMBEDDED_PROTOTYPES
+        };
+
         if proto_bytes.len() % 4 != 0 {
             return Err("invalid prototype file size".into());
         }

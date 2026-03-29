@@ -38,3 +38,5 @@ logo/
 *.bak
 *.tmp
 .ruff_cache/
+scripts/
+venv/

@@ -36,6 +36,8 @@
 //!   `ClassificationResult`.
 //! - [`model_paths`] — default filesystem locations for ONNX model files and
 //!   prototype vectors, plus validation helpers.
+//! - [`model_registry`] — downloadable model definitions and install/remove
+//!   helpers used by the GUI model manager.
 //!
 //! ## Feature flags
 //!
@@ -66,6 +68,7 @@
 
 pub mod cloud;
 pub mod model_paths;
+pub mod model_registry;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 pub mod pipeline;

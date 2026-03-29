@@ -5342,6 +5342,7 @@ dependencies = [
  "futures",
  "iced",
  "image 0.25.10",
+ "reqwest",
  "rfd",
  "serde",
  "serde_json",

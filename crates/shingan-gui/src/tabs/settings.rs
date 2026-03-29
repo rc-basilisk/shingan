@@ -1,5 +1,9 @@
-use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Rule};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input, Rule,
+};
 use iced::{Element, Length, Task};
+use shingan_ml::model_registry::{self, ModelDef, DEFAULT_MODELS};
 use std::path::PathBuf;
 
 /// State for the Settings tab.
@@ -14,8 +18,29 @@ pub struct SettingsState {
     pub max_cloud_requests: String,
     pub ollama_url: String,
     pub vision_model: String,
-    pub model_status: ModelStatus,
     pub status_message: Option<String>,
+    /// Per-model installed status, keyed by model ID.
+    pub model_statuses: Vec<(String, bool)>,
+    /// Current download state.
+    pub download: DownloadState,
+}
+
+/// Download progress state shown in the UI.
+#[derive(Debug, Clone)]
+pub enum DownloadState {
+    Idle,
+    Downloading {
+        model_id: String,
+        current_file: String,
+        file_index: usize,
+        file_count: usize,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Failed {
+        model_id: String,
+        error: String,
+    },
 }
 
 /// Which cloud backend to use when cloud escalation is enabled.
@@ -53,16 +78,6 @@ impl Default for CloudProvider {
     }
 }
 
-/// Whether the ONNX model files are present on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelStatus {
-    #[allow(dead_code)]
-    Unknown,
-    Present,
-    Missing,
-    Downloading,
-}
-
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     ThreadCountChanged(String),
@@ -75,36 +90,36 @@ pub enum SettingsMessage {
     MaxCloudRequestsChanged(String),
     OllamaUrlChanged(String),
     VisionModelChanged(String),
-    CheckModelStatus,
-    DownloadModel,
-    #[allow(dead_code)]
-    ModelDownloadComplete(Result<(), String>),
+    StartDownload(String),
+    CancelDownload,
+    RemoveModel(String),
+    DownloadProgress {
+        current_file: String,
+        file_index: usize,
+        file_count: usize,
+        downloaded: u64,
+        total: u64,
+    },
+    DownloadComplete(Result<(), String>),
     SaveSettings,
     ClearSessions,
     OptimizeDb,
     ClearCache,
 }
 
-fn check_model_files_present(custom_path: &str) -> ModelStatus {
-    let dir = if custom_path.is_empty() {
-        shingan_ml::model_paths::default_models_dir()
-    } else {
-        PathBuf::from(custom_path)
-    };
-    let onnx = dir.join("clip_image.onnx");
-    let proto = dir.join("clip_prototypes.bin");
-    if onnx.is_file() && proto.is_file() {
-        ModelStatus::Present
-    } else {
-        ModelStatus::Missing
-    }
+fn refresh_model_statuses(custom_path: &str) -> Vec<(String, bool)> {
+    let dir = model_registry::resolve_models_dir(custom_path);
+    DEFAULT_MODELS
+        .iter()
+        .map(|m| (m.id.to_string(), model_registry::model_installed(m, &dir)))
+        .collect()
 }
 
 impl Default for SettingsState {
     fn default() -> Self {
         let settings = load_settings();
         let ml_path = settings.ml_model_path.clone().unwrap_or_default();
-        let model_status = check_model_files_present(&ml_path);
+        let model_statuses = refresh_model_statuses(&ml_path);
         Self {
             thread_count: settings.thread_count.to_string(),
             cache_size_mb: settings.cache_size_mb.to_string(),
@@ -119,20 +134,32 @@ impl Default for SettingsState {
                 .unwrap_or_default(),
             ollama_url: settings.ollama_url,
             vision_model: settings.vision_model,
-            model_status,
             status_message: None,
+            model_statuses,
+            download: DownloadState::Idle,
         }
     }
 }
 
 impl SettingsState {
+    /// Whether a download subscription should be active.
+    pub fn is_downloading(&self) -> bool {
+        matches!(self.download, DownloadState::Downloading { .. })
+    }
+
+    fn is_model_installed(&self, model_id: &str) -> bool {
+        self.model_statuses
+            .iter()
+            .any(|(id, installed)| id == model_id && *installed)
+    }
+
     pub fn update(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
         match message {
             SettingsMessage::ThreadCountChanged(val) => self.thread_count = val,
             SettingsMessage::CacheSizeChanged(val) => self.cache_size_mb = val,
             SettingsMessage::MlModelPathChanged(val) => {
                 self.ml_model_path = val;
-                self.model_status = check_model_files_present(&self.ml_model_path);
+                self.model_statuses = refresh_model_statuses(&self.ml_model_path);
             }
             SettingsMessage::ConfidenceThresholdChanged(val) => self.confidence_threshold = val,
             SettingsMessage::ToggleCloud(val) => self.cloud_enabled = val,
@@ -141,38 +168,113 @@ impl SettingsState {
             SettingsMessage::MaxCloudRequestsChanged(val) => self.max_cloud_requests = val,
             SettingsMessage::OllamaUrlChanged(val) => self.ollama_url = val,
             SettingsMessage::VisionModelChanged(val) => self.vision_model = val,
-            SettingsMessage::CheckModelStatus => {
-                self.model_status = check_model_files_present(&self.ml_model_path);
-                self.status_message = Some(match &self.model_status {
-                    ModelStatus::Present => "ONNX model found.".to_string(),
-                    ModelStatus::Missing => {
-                        let dir = if self.ml_model_path.is_empty() {
-                            shingan_ml::model_paths::default_models_dir()
-                        } else {
-                            PathBuf::from(&self.ml_model_path)
+
+            SettingsMessage::StartDownload(model_id) => {
+                if let Some(model) = model_registry::find_model(&model_id) {
+                    if !model_registry::model_downloadable(model) {
+                        self.download = DownloadState::Failed {
+                            model_id,
+                            error: "Download URLs are not yet configured for this model."
+                                .to_string(),
                         };
-                        format!("Model not found in {}", dir.display())
-                    }
-                    _ => String::new(),
-                });
-            }
-            SettingsMessage::DownloadModel => {
-                self.model_status = ModelStatus::Downloading;
-                self.status_message = Some("Model download not yet implemented — place clip_image.onnx and clip_prototypes.bin manually.".to_string());
-                self.model_status = ModelStatus::Missing;
-            }
-            SettingsMessage::ModelDownloadComplete(result) => {
-                match result {
-                    Ok(()) => {
-                        self.model_status = ModelStatus::Present;
-                        self.status_message = Some("Model downloaded successfully.".to_string());
-                    }
-                    Err(e) => {
-                        self.model_status = ModelStatus::Missing;
-                        self.status_message = Some(format!("Download failed: {}", e));
+                    } else {
+                        let first_file = model
+                            .files
+                            .first()
+                            .map(|f| f.filename.to_string())
+                            .unwrap_or_default();
+                        self.download = DownloadState::Downloading {
+                            model_id,
+                            current_file: first_file,
+                            file_index: 0,
+                            file_count: model.files.len(),
+                            downloaded_bytes: 0,
+                            total_bytes: 0,
+                        };
+                        self.status_message = None;
                     }
                 }
             }
+
+            SettingsMessage::CancelDownload => {
+                // Clean up partial files for the model being downloaded.
+                if let DownloadState::Downloading { ref model_id, .. } = self.download {
+                    if let Some(model) = model_registry::find_model(model_id) {
+                        let dir = model_registry::resolve_models_dir(&self.ml_model_path);
+                        for file in model.files {
+                            let path = dir.join(file.filename);
+                            // Only remove if it's not a complete, previously-installed file.
+                            // We can't easily tell, so just leave files in place — the status
+                            // check will reflect reality.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                self.download = DownloadState::Idle;
+                self.model_statuses = refresh_model_statuses(&self.ml_model_path);
+                self.status_message = Some("Download cancelled.".to_string());
+            }
+
+            SettingsMessage::RemoveModel(model_id) => {
+                if let Some(model) = model_registry::find_model(&model_id) {
+                    let dir = model_registry::resolve_models_dir(&self.ml_model_path);
+                    match model_registry::remove_model(model, &dir) {
+                        Ok(()) => {
+                            self.status_message =
+                                Some(format!("{} removed.", model.name));
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Remove failed: {}", e));
+                        }
+                    }
+                    self.model_statuses = refresh_model_statuses(&self.ml_model_path);
+                }
+            }
+
+            SettingsMessage::DownloadProgress {
+                current_file,
+                file_index,
+                file_count,
+                downloaded,
+                total,
+            } => {
+                if let DownloadState::Downloading {
+                    current_file: ref mut cf,
+                    file_index: ref mut fi,
+                    file_count: ref mut fc,
+                    downloaded_bytes: ref mut db,
+                    total_bytes: ref mut tb,
+                    ..
+                } = self.download
+                {
+                    *cf = current_file;
+                    *fi = file_index;
+                    *fc = file_count;
+                    *db = downloaded;
+                    *tb = total;
+                }
+            }
+
+            SettingsMessage::DownloadComplete(result) => {
+                match result {
+                    Ok(()) => {
+                        self.status_message = Some("Model downloaded successfully.".to_string());
+                        self.download = DownloadState::Idle;
+                    }
+                    Err(e) => {
+                        let model_id = match &self.download {
+                            DownloadState::Downloading { model_id, .. } => model_id.clone(),
+                            _ => String::new(),
+                        };
+                        self.download = DownloadState::Failed {
+                            model_id,
+                            error: e,
+                        };
+                    }
+                }
+                self.model_statuses = refresh_model_statuses(&self.ml_model_path);
+            }
+
             SettingsMessage::SaveSettings => {
                 let settings = AppSettings {
                     thread_count: self.thread_count.parse().unwrap_or(4),
@@ -259,42 +361,33 @@ impl SettingsState {
 
         // -- Local ML card --
         {
-            let status_text = match &self.model_status {
-                ModelStatus::Unknown => "Model status: unknown",
-                ModelStatus::Present => "Model status: found",
-                ModelStatus::Missing => "Model status: not found",
-                ModelStatus::Downloading => "Model status: downloading...",
-            };
-
-            let card = container(
-                column![
-                    text("Local ML Categorization").size(16),
-                    row![
-                        text("Confidence threshold (0-1):").width(label_width),
-                        text_input("0.60", &self.confidence_threshold)
-                            .on_input(SettingsMessage::ConfidenceThresholdChanged)
-                            .width(100),
-                    ]
-                    .spacing(10),
-                    row![
-                        text("Custom model path (optional):").width(label_width),
-                        text_input("Leave empty for default", &self.ml_model_path)
-                            .on_input(SettingsMessage::MlModelPathChanged)
-                            .width(Length::Fill),
-                    ]
-                    .spacing(10),
-                    row![
-                        text(status_text).width(250),
-                        button(text("Check").size(12)).padding([4, 10]).on_press(SettingsMessage::CheckModelStatus),
-                        button(text("Download Model").size(12)).padding([4, 10]).on_press(SettingsMessage::DownloadModel),
-                    ]
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center),
+            let mut ml_col = column![
+                text("Local ML Categorization").size(16),
+                row![
+                    text("Confidence threshold (0-1):").width(label_width),
+                    text_input("0.60", &self.confidence_threshold)
+                        .on_input(SettingsMessage::ConfidenceThresholdChanged)
+                        .width(100),
                 ]
                 .spacing(10),
-            )
-            .padding(15)
-            .width(Length::Fill);
+                row![
+                    text("Custom model path (optional):").width(label_width),
+                    text_input("Leave empty for default", &self.ml_model_path)
+                        .on_input(SettingsMessage::MlModelPathChanged)
+                        .width(Length::Fill),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10);
+
+            // Model roster
+            ml_col = ml_col.push(text("Models").size(14));
+
+            for model in DEFAULT_MODELS {
+                ml_col = ml_col.push(self.view_model_card(model));
+            }
+
+            let card = container(ml_col).padding(15).width(Length::Fill);
             content = content.push(card);
         }
 
@@ -304,8 +397,11 @@ impl SettingsState {
         {
             let mut cloud_fields = column![
                 text("Cloud APIs (Advanced)").size(16),
-                checkbox("Enable cloud escalation for low-confidence images", self.cloud_enabled)
-                    .on_toggle(SettingsMessage::ToggleCloud),
+                checkbox(
+                    "Enable cloud escalation for low-confidence images",
+                    self.cloud_enabled
+                )
+                .on_toggle(SettingsMessage::ToggleCloud),
                 row![
                     text("Cloud provider:").width(label_width),
                     pick_list(
@@ -373,9 +469,15 @@ impl SettingsState {
                 column![
                     text("Database & Cache").size(16),
                     row![
-                        button(text("Clear Old Sessions").size(13)).padding([6, 14]).on_press(SettingsMessage::ClearSessions),
-                        button(text("Optimize Database").size(13)).padding([6, 14]).on_press(SettingsMessage::OptimizeDb),
-                        button(text("Clear Thumbnail Cache").size(13)).padding([6, 14]).on_press(SettingsMessage::ClearCache),
+                        button(text("Clear Old Sessions").size(13))
+                            .padding([6, 14])
+                            .on_press(SettingsMessage::ClearSessions),
+                        button(text("Optimize Database").size(13))
+                            .padding([6, 14])
+                            .on_press(SettingsMessage::OptimizeDb),
+                        button(text("Clear Thumbnail Cache").size(13))
+                            .padding([6, 14])
+                            .on_press(SettingsMessage::ClearCache),
                     ]
                     .spacing(10),
                 ]
@@ -401,12 +503,153 @@ impl SettingsState {
 
         // -- Status --
         if let Some(ref msg) = self.status_message {
-            content = content.push(
-                container(text(msg).size(14)).padding([8, 12]),
-            );
+            content = content.push(container(text(msg).size(14)).padding([8, 12]));
         }
 
         scrollable(container(content).width(Length::Fill)).into()
+    }
+
+    /// Render a single model card within the ML section.
+    fn view_model_card<'a>(&self, model: &ModelDef) -> Element<'a, SettingsMessage> {
+        let installed = self.is_model_installed(model.id);
+
+        // Header: name + size
+        let header = row![
+            text(model.name).size(13),
+            iced::widget::horizontal_space(),
+            text(model.size_label).size(12),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let desc = text(model.description).size(12);
+
+        // Status row depends on current state
+        let status_row: Element<'a, SettingsMessage> = if let DownloadState::Downloading {
+            ref model_id,
+            ref current_file,
+            file_index,
+            file_count,
+            downloaded_bytes,
+            total_bytes,
+            ..
+        } = self.download
+        {
+            if model_id == model.id {
+                let pct = if total_bytes > 0 {
+                    (downloaded_bytes as f32 / total_bytes as f32) * 100.0
+                } else {
+                    0.0
+                };
+                let progress_label = if total_bytes > 0 {
+                    format!(
+                        "Downloading {} ({}/{})... {} / {}",
+                        current_file,
+                        file_index + 1,
+                        file_count,
+                        format_bytes(downloaded_bytes),
+                        format_bytes(total_bytes),
+                    )
+                } else {
+                    format!(
+                        "Downloading {} ({}/{})... {}",
+                        current_file,
+                        file_index + 1,
+                        file_count,
+                        format_bytes(downloaded_bytes),
+                    )
+                };
+                column![
+                    text(progress_label).size(12),
+                    row![
+                        progress_bar(0.0..=100.0, pct).height(6).width(Length::Fill),
+                        button(text("Cancel").size(11))
+                            .padding([3, 8])
+                            .on_press(SettingsMessage::CancelDownload),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .spacing(4)
+                .into()
+            } else {
+                // Another model is downloading — show this one's normal status.
+                self.view_model_status_row(model, installed)
+            }
+        } else if let DownloadState::Failed {
+            ref model_id,
+            ref error,
+        } = self.download
+        {
+            if model_id == model.id {
+                column![
+                    text(format!("Download failed: {}", error)).size(12),
+                    row![
+                        button(text("Retry").size(11))
+                            .padding([3, 8])
+                            .on_press(SettingsMessage::StartDownload(model.id.to_string())),
+                    ],
+                ]
+                .spacing(4)
+                .into()
+            } else {
+                self.view_model_status_row(model, installed)
+            }
+        } else {
+            self.view_model_status_row(model, installed)
+        };
+
+        container(
+            column![header, desc, status_row].spacing(4),
+        )
+        .padding([8, 12])
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// The idle status row for a model: "Installed [Remove]" or "Not installed [Download]".
+    fn view_model_status_row<'a>(
+        &self,
+        model: &ModelDef,
+        installed: bool,
+    ) -> Element<'a, SettingsMessage> {
+        if installed {
+            row![
+                text("Installed").size(12),
+                iced::widget::horizontal_space(),
+                button(text("Remove").size(11))
+                    .padding([3, 8])
+                    .on_press(SettingsMessage::RemoveModel(model.id.to_string())),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            let downloadable = model_registry::model_downloadable(model);
+            let mut dl_btn = button(text("Download").size(11)).padding([3, 8]);
+            if downloadable && !self.is_downloading() {
+                dl_btn = dl_btn.on_press(SettingsMessage::StartDownload(model.id.to_string()));
+            }
+            row![
+                text("Not installed").size(12),
+                iced::widget::horizontal_space(),
+                dl_btn,
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.0} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -593,30 +836,33 @@ mod tests {
     }
 
     #[test]
-    fn settings_update_ml_model_path_updates_status() {
+    fn settings_update_ml_model_path_refreshes_statuses() {
         let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::MlModelPathChanged("/nonexistent/path".to_string()));
+        let _ = state.update(SettingsMessage::MlModelPathChanged(
+            "/nonexistent/path".to_string(),
+        ));
         assert_eq!(state.ml_model_path, "/nonexistent/path");
-        assert_eq!(state.model_status, ModelStatus::Missing);
+        // All models should show as not installed for a bogus path.
+        for (_id, installed) in &state.model_statuses {
+            assert!(!installed);
+        }
     }
 
     #[test]
-    fn settings_update_check_model_sets_status_message() {
+    fn settings_update_remove_nonexistent_model() {
         let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::CheckModelStatus);
+        // Removing from a nonexistent path should succeed (nothing to remove).
+        state.ml_model_path = "/tmp/shingan_test_nonexistent".to_string();
+        let _ = state.update(SettingsMessage::RemoveModel("clip-vit-b32".to_string()));
         assert!(state.status_message.is_some());
     }
 
     #[test]
-    fn model_status_check_nonexistent() {
-        let status = check_model_files_present("/definitely/not/a/real/path");
-        assert_eq!(status, ModelStatus::Missing);
-    }
-
-    #[test]
-    fn model_status_check_empty_string_uses_default() {
-        let status = check_model_files_present("");
-        // Default dir likely doesn't have model files, but should not panic
-        assert!(status == ModelStatus::Missing || status == ModelStatus::Present);
+    fn format_bytes_various_sizes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1_500), "2 KB");
+        assert_eq!(format_bytes(5_500_000), "5.5 MB");
+        assert_eq!(format_bytes(1_200_000_000), "1.2 GB");
     }
 }

@@ -92,12 +92,11 @@ Grouped by type:
 
 ### Model files
 
-Tier 2 requires two files in `$XDG_DATA_HOME/shingan/models/` (typically `~/.local/share/shingan/models/`):
+Tier 2 requires one model file: `clip_image.onnx` (CLIP ViT-B/32 image encoder, ~340 MB). The category prototype vectors are embedded in the binary at compile time.
 
-- `clip_image.onnx` — CLIP ViT-B/32 image encoder
-- `clip_prototypes.bin` — precomputed L2-normalized text embeddings for each category's CLIP prompt (24 × embed_dim float32 values, little-endian)
+The model can be downloaded directly from the **Settings > Local ML Categorization** panel in the GUI, which shows download progress and status. Alternatively, place the file manually in `$XDG_DATA_HOME/shingan/models/` (typically `~/.local/share/shingan/models/`).
 
-If these files are absent, Tier 2 is silently skipped.
+If the model file is absent, Tier 2 is silently skipped.
 
 ## Installation
 
@@ -175,7 +174,7 @@ The GUI provides tabbed access to the duplicate finder, auto-sorter, and setting
 The **Settings** tab lets you configure:
 
 - **Performance** — scanner threads and thumbnail cache size
-- **Local ML** — confidence threshold for tier escalation, custom model directory, model status check and download trigger
+- **Local ML** — model manager (download, remove, status), confidence threshold for tier escalation, custom model directory
 - **Cloud APIs** — cloud provider selection (Ollama/OpenAI/Gemini/Anthropic), API key input, Ollama URL + model name, max requests per session cost guardrail
 - **Database** — clear sessions, optimize/vacuum
 - **Cache** — clear thumbnail cache

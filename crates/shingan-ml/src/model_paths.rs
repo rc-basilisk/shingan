@@ -1,12 +1,12 @@
 //! Filesystem locations and validation for ONNX model files.
 //!
-//! The Tier 2 CLIP classifier requires two files:
+//! The Tier 2 CLIP classifier requires `clip_image.onnx` (the CLIP ViT-B/32
+//! image encoder in ONNX format) to be present on disk.  The category prototype
+//! vectors (`clip_prototypes.bin`) are embedded in the binary at compile time;
+//! an on-disk copy in the same directory is used if present (for
+//! experimentation) but is not required.
 //!
-//! - `clip_image.onnx` — the CLIP ViT-B/32 image encoder in ONNX format
-//! - `clip_prototypes.bin` — precomputed text embeddings (24 rows × embed_dim
-//!   float32 values, little-endian)
-//!
-//! By default these are stored under `$XDG_DATA_HOME/shingan/models/`
+//! By default model files are stored under `$XDG_DATA_HOME/shingan/models/`
 //! (typically `~/.local/share/shingan/models/` on Linux). The functions in this
 //! module provide the canonical paths and a [`validate_prototype_file`] helper
 //! that checks file size matches the expected `24 × embed_dim × 4` bytes.
