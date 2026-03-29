@@ -132,17 +132,24 @@ fn cmd_scan(
     let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
     let control = Arc::new(ScanControl::new());
 
+    // Pre-load cached signatures from DB
+    let scan_paths: Vec<(PathBuf, bool)> = paths.iter().map(|p| (p.clone(), recursive)).collect();
+    let cached = load_cached_signatures_cli(db, &scan_paths, &categories);
+    let cache_count = cached.len();
+    if cache_count > 0 {
+        eprintln!("Loaded {} cached signatures from previous scans", cache_count);
+    }
+
     let scanner = DuplicateScanner::new(
         &categories,
         detectors,
         threshold,
         control.clone(),
         progress_tx,
-    );
+    )
+    .with_cached_signatures(cached);
 
     // Run scanner in background thread
-    let scan_paths: Vec<(PathBuf, bool)> = paths.iter().map(|p| (p.clone(), recursive)).collect();
-
     let handle = std::thread::spawn(move || scanner.scan_paths(&scan_paths));
 
     // Print progress
@@ -153,10 +160,16 @@ fn cmd_scan(
                 current,
                 total,
                 message,
+                elapsed_secs,
+                eta_secs,
             } => {
                 if total > 0 {
                     let pct = (current as f64 / total as f64 * 100.0) as u32;
-                    eprint!("\r[{:3}%] {}", pct, message);
+                    let elapsed = format_duration_cli(elapsed_secs);
+                    let eta = eta_secs
+                        .map(|e| format!(" ETA: {}", format_duration_cli(e)))
+                        .unwrap_or_default();
+                    eprint!("\r[{:3}%] {} | {}{}", pct, message, elapsed, eta);
                 }
             }
             ScanProgress::PhaseCompleted { category, groups } => {
@@ -244,10 +257,16 @@ fn cmd_scan(
         }
     }
 
-    let results = handle
+    let (results, new_sigs) = handle
         .join()
         .map_err(|_| anyhow::anyhow!("Scanner thread panicked"))?;
     db.update_session_status(session_id, "completed").ok();
+
+    // Persist newly computed signatures for future rescans
+    if !new_sigs.is_empty() {
+        persist_new_signatures_cli(db, &new_sigs, &paths, recursive);
+        eprintln!("Cached {} new signatures for future scans", new_sigs.len());
+    }
 
     let total_groups: usize = results.values().map(|g| g.len()).sum();
     let total_files: usize = results
@@ -353,4 +372,143 @@ fn chrono_format_timestamp(secs: u64) -> String {
     // Basic ISO-ish format: just return the unix timestamp as a string
     // In a real app, you'd use chrono or time crate
     format!("{}", secs)
+}
+
+fn format_duration_cli(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn load_cached_signatures_cli(
+    db: &Database,
+    scan_paths: &[(PathBuf, bool)],
+    categories: &[FileCategory],
+) -> HashMap<String, String> {
+    use shingan_core::file_info::ExtensionMap;
+    use std::collections::HashSet;
+
+    let ext_map = ExtensionMap::new();
+    let cat_set: HashSet<FileCategory> = categories.iter().copied().collect();
+    let mut queries: Vec<(String, i64, i64, String)> = Vec::new();
+
+    for (path, recursive) in scan_paths {
+        let walker = if *recursive {
+            walkdir::WalkDir::new(path).follow_links(false).into_iter()
+        } else {
+            walkdir::WalkDir::new(path)
+                .max_depth(1)
+                .follow_links(false)
+                .into_iter()
+        };
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let fpath = entry.path();
+            let ext = match fpath.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_lowercase(),
+                None => continue,
+            };
+            let cat = match ext_map.get(&ext) {
+                Some(c) if cat_set.contains(&c) => c,
+                _ => continue,
+            };
+            if let Ok(meta) = std::fs::metadata(fpath) {
+                let size = meta.len() as i64;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                queries.push((
+                    fpath.to_string_lossy().into_owned(),
+                    size,
+                    mtime,
+                    cat.label().to_string(),
+                ));
+            }
+        }
+    }
+
+    if queries.is_empty() {
+        return HashMap::new();
+    }
+
+    let query_refs: Vec<(&str, i64, i64, &str)> = queries
+        .iter()
+        .map(|(p, s, m, c)| (p.as_str(), *s, *m, c.as_str()))
+        .collect();
+
+    db.get_cached_signatures(&query_refs).unwrap_or_default()
+}
+
+fn persist_new_signatures_cli(
+    db: &Database,
+    new_sigs: &[(String, String)],
+    paths: &[PathBuf],
+    recursive: bool,
+) {
+    let ext_map = shingan_core::file_info::ExtensionMap::new();
+    let mut file_meta: HashMap<String, (i64, i64, String)> = HashMap::new();
+
+    for path in paths {
+        let walker = if recursive {
+            walkdir::WalkDir::new(path).follow_links(false).into_iter()
+        } else {
+            walkdir::WalkDir::new(path)
+                .max_depth(1)
+                .follow_links(false)
+                .into_iter()
+        };
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let fpath = entry.path();
+            if let Ok(meta) = std::fs::metadata(fpath) {
+                let ext = fpath
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let cat = match ext_map.get(&ext) {
+                    Some(c) => c.label().to_string(),
+                    None => continue,
+                };
+                let size = meta.len() as i64;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                file_meta.insert(fpath.to_string_lossy().into_owned(), (size, mtime, cat));
+            }
+        }
+    }
+
+    let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
+        .iter()
+        .filter_map(|(path, sig)| {
+            file_meta
+                .get(path)
+                .map(|(size, mtime, cat)| (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str()))
+        })
+        .collect();
+
+    if !entries.is_empty() {
+        if let Err(e) = db.cache_signatures_batch(&entries) {
+            eprintln!("Failed to cache signatures: {e}");
+        }
+    }
 }

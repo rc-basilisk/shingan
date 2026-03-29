@@ -19,5 +19,6 @@ serde_json.workspace = true
 dirs.workspace = true
 image.workspace = true
 crossbeam-channel.workspace = true
+walkdir.workspace = true
 futures = "0.3"
 syntect.workspace = true

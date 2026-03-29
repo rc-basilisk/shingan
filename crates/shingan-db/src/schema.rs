@@ -41,6 +41,15 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_file_entries_file_path ON file_entries(file_path);
         CREATE INDEX IF NOT EXISTS idx_scan_sessions_created_at ON scan_sessions(created_at);
 
+        CREATE TABLE IF NOT EXISTS signature_cache (
+            file_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            modified_at INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            PRIMARY KEY (file_path, category)
+        );
+
         CREATE TABLE IF NOT EXISTS sorting_sessions (
             id INTEGER PRIMARY KEY,
             name TEXT,

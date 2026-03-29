@@ -5180,6 +5180,7 @@ dependencies = [
  "serde_json",
  "shingan-core",
  "shingan-db",
+ "walkdir",
 ]
 
 [[package]]
@@ -5238,6 +5239,7 @@ dependencies = [
  "shingan-utils",
  "syntect",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]

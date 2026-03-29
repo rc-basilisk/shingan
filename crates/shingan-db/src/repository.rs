@@ -1,6 +1,7 @@
 use crate::models::*;
 use crate::schema;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -285,6 +286,61 @@ impl Database {
         })
     }
 
+    // --- Signature Cache ---
+
+    /// Look up cached signatures for files that haven't changed (same size + mtime).
+    /// Returns a map from file_path to signature for cache hits.
+    pub fn get_cached_signatures(
+        &self,
+        files: &[(&str, i64, i64, &str)], // (path, size, modified_secs, category)
+    ) -> Result<HashMap<String, String>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT signature FROM signature_cache
+                 WHERE file_path = ?1 AND file_size = ?2 AND modified_at = ?3 AND category = ?4",
+            )?;
+            let mut result = HashMap::new();
+            for &(path, size, mtime, category) in files {
+                if let Ok(sig) = stmt.query_row(params![path, size, mtime, category], |row| {
+                    row.get::<_, String>(0)
+                }) {
+                    result.insert(path.to_string(), sig);
+                }
+            }
+            Ok(result)
+        })
+    }
+
+    /// Store computed signatures in the cache (upsert).
+    pub fn cache_signatures_batch(
+        &self,
+        entries: &[(&str, i64, i64, &str, &str)], // (path, size, modified_secs, category, signature)
+    ) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN TRANSACTION")?;
+            let result = (|| -> Result<(), DbError> {
+                for &(path, size, mtime, category, signature) in entries {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO signature_cache (file_path, file_size, modified_at, category, signature)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![path, size, mtime, category, signature],
+                    )?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK").ok();
+                    Err(e)
+                }
+            }
+        })
+    }
+
     // --- Maintenance ---
 
     pub fn vacuum(&self) -> Result<(), DbError> {
@@ -462,5 +518,45 @@ mod tests {
         let groups = db.get_duplicate_groups(sid).unwrap();
         assert!(groups.is_empty());
         assert!(db.get_file_entries(gid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_signature_cache() {
+        let db = test_db();
+
+        // Cache some signatures
+        let entries = [
+            ("/tmp/a.png", 1024_i64, 1000_i64, "image", "sig_a"),
+            ("/tmp/b.png", 2048, 2000, "image", "sig_b"),
+        ];
+        db.cache_signatures_batch(&entries).unwrap();
+
+        // Query with matching metadata -> cache hit
+        let queries = [
+            ("/tmp/a.png", 1024_i64, 1000_i64, "image"),
+            ("/tmp/b.png", 2048, 2000, "image"),
+            ("/tmp/c.png", 512, 500, "image"), // not cached
+        ];
+        let cached = db.get_cached_signatures(&queries).unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached["/tmp/a.png"], "sig_a");
+        assert_eq!(cached["/tmp/b.png"], "sig_b");
+
+        // Query with changed size -> cache miss
+        let queries_changed = [("/tmp/a.png", 9999_i64, 1000_i64, "image")];
+        let cached2 = db.get_cached_signatures(&queries_changed).unwrap();
+        assert!(cached2.is_empty());
+
+        // Query with changed mtime -> cache miss
+        let queries_mtime = [("/tmp/a.png", 1024_i64, 9999_i64, "image")];
+        let cached3 = db.get_cached_signatures(&queries_mtime).unwrap();
+        assert!(cached3.is_empty());
+
+        // Upsert: update signature for existing file
+        let updated = [("/tmp/a.png", 1024_i64, 3000_i64, "image", "sig_a_v2")];
+        db.cache_signatures_batch(&updated).unwrap();
+        let queries_new = [("/tmp/a.png", 1024_i64, 3000_i64, "image")];
+        let cached4 = db.get_cached_signatures(&queries_new).unwrap();
+        assert_eq!(cached4["/tmp/a.png"], "sig_a_v2");
     }
 }

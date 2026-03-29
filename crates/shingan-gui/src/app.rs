@@ -213,7 +213,7 @@ impl App {
                 subs.push(
                     Subscription::run_with_id(
                         "scanner",
-                        scan_subscription(paths, categories, threshold, control),
+                        scan_subscription(paths, categories, threshold, control, self.db.clone()),
                     )
                     .map(|progress| Message::Finder(FinderMessage::ScanProgress(progress))),
                 );
@@ -319,6 +319,7 @@ fn scan_subscription(
     categories: Vec<FileCategory>,
     threshold: f64,
     control: Arc<ScanControl>,
+    db: Arc<Database>,
 ) -> impl futures::Stream<Item = ScanProgress> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
@@ -348,18 +349,27 @@ fn scan_subscription(
             }
         }
 
+        // Pre-load cached signatures from DB for all scan paths
+        let cached_signatures = load_cached_signatures(&db, &paths, &categories);
+
         let scanner = DuplicateScanner::new(
             &categories,
             detectors,
             threshold,
             control,
             progress_tx,
-        );
+        )
+        .with_cached_signatures(cached_signatures);
 
-        // Run scanner on blocking thread
+        // Run scanner on blocking thread, collecting new signatures to persist
         let paths_clone = paths.clone();
+        let db_clone = db.clone();
         tokio::task::spawn_blocking(move || {
-            scanner.scan_paths(&paths_clone);
+            let (_results, new_sigs) = scanner.scan_paths(&paths_clone);
+            // Persist newly computed signatures for future rescans
+            if !new_sigs.is_empty() {
+                persist_new_signatures(&db_clone, &new_sigs, &paths_clone, &categories);
+            }
         });
 
         // Forward progress messages to the iced stream.
@@ -387,6 +397,136 @@ fn scan_subscription(
 }
 
 /// Create a stream of SorterMessages from a background auto-sorter.
+/// Walk scan paths and query DB for cached signatures of files that haven't changed.
+fn load_cached_signatures(
+    db: &Database,
+    paths: &[(PathBuf, bool)],
+    categories: &[FileCategory],
+) -> HashMap<String, String> {
+    use shingan_core::file_info::ExtensionMap;
+    use std::collections::HashSet;
+
+    let ext_map = ExtensionMap::new();
+    let cat_set: HashSet<FileCategory> = categories.iter().copied().collect();
+    let mut queries: Vec<(String, i64, i64, String)> = Vec::new();
+
+    for (path, include_subdirs) in paths {
+        let walker = if *include_subdirs {
+            walkdir::WalkDir::new(path).follow_links(false).into_iter()
+        } else {
+            walkdir::WalkDir::new(path)
+                .max_depth(1)
+                .follow_links(false)
+                .into_iter()
+        };
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let fpath = entry.path();
+            let ext = match fpath.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_lowercase(),
+                None => continue,
+            };
+            let cat = match ext_map.get(&ext) {
+                Some(c) if cat_set.contains(&c) => c,
+                _ => continue,
+            };
+            if let Ok(meta) = std::fs::metadata(fpath) {
+                let size = meta.len() as i64;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                queries.push((
+                    fpath.to_string_lossy().into_owned(),
+                    size,
+                    mtime,
+                    cat.label().to_string(),
+                ));
+            }
+        }
+    }
+
+    if queries.is_empty() {
+        return HashMap::new();
+    }
+
+    // Query DB in batches to avoid overly long single queries
+    let query_refs: Vec<(&str, i64, i64, &str)> = queries
+        .iter()
+        .map(|(p, s, m, c)| (p.as_str(), *s, *m, c.as_str()))
+        .collect();
+
+    db.get_cached_signatures(&query_refs).unwrap_or_default()
+}
+
+/// Persist newly computed signatures to the DB for future rescans.
+fn persist_new_signatures(
+    db: &Database,
+    new_sigs: &[(String, String)],
+    paths: &[(PathBuf, bool)],
+    _categories: &[FileCategory],
+) {
+    // Build a lookup of path -> (size, mtime, category) from discovered files
+    let mut file_meta: HashMap<String, (i64, i64, String)> = HashMap::new();
+
+    // We need file metadata for each signature. Walk the paths to get it.
+    for (path, include_subdirs) in paths {
+        let walker = if *include_subdirs {
+            walkdir::WalkDir::new(path).follow_links(false).into_iter()
+        } else {
+            walkdir::WalkDir::new(path)
+                .max_depth(1)
+                .follow_links(false)
+                .into_iter()
+        };
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let fpath = entry.path();
+            if let Ok(meta) = std::fs::metadata(fpath) {
+                let ext = fpath
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let ext_map = shingan_core::file_info::ExtensionMap::new();
+                let cat = match ext_map.get(&ext) {
+                    Some(c) => c.label().to_string(),
+                    None => continue,
+                };
+                let size = meta.len() as i64;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                file_meta.insert(fpath.to_string_lossy().into_owned(), (size, mtime, cat));
+            }
+        }
+    }
+
+    let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
+        .iter()
+        .filter_map(|(path, sig)| {
+            file_meta
+                .get(path)
+                .map(|(size, mtime, cat)| (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str()))
+        })
+        .collect();
+
+    if !entries.is_empty() {
+        if let Err(e) = db.cache_signatures_batch(&entries) {
+            eprintln!("Failed to cache signatures: {e}");
+        }
+    }
+}
+
 fn sort_subscription(
     sources: Vec<PathBuf>,
     destination: PathBuf,

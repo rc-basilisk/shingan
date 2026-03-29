@@ -65,8 +65,18 @@ impl FileTypeSelection {
 #[derive(Debug, Clone)]
 pub enum ScanState {
     Idle,
-    Running { progress: f32, status: String },
-    Paused { progress: f32, status: String },
+    Running {
+        progress: f32,
+        status: String,
+        elapsed_secs: f64,
+        eta_secs: Option<f64>,
+    },
+    Paused {
+        progress: f32,
+        status: String,
+        elapsed_secs: f64,
+        eta_secs: Option<f64>,
+    },
     Completed,
 }
 
@@ -188,6 +198,8 @@ impl DuplicateFinderState {
                 self.scan_state = ScanState::Running {
                     progress: 0.0,
                     status: "Starting scan...".to_string(),
+                    elapsed_secs: 0.0,
+                    eta_secs: None,
                 };
                 self.results = None;
                 self.status_message = None;
@@ -198,10 +210,17 @@ impl DuplicateFinderState {
                 if let Some(control) = &self.scan_control {
                     control.pause();
                 }
-                if let ScanState::Running { progress, status: _ } = &self.scan_state {
+                if let ScanState::Running {
+                    progress,
+                    elapsed_secs,
+                    ..
+                } = &self.scan_state
+                {
                     self.scan_state = ScanState::Paused {
                         progress: *progress,
                         status: "Paused".to_string(),
+                        elapsed_secs: *elapsed_secs,
+                        eta_secs: None,
                     };
                 }
             }
@@ -209,10 +228,17 @@ impl DuplicateFinderState {
                 if let Some(control) = &self.scan_control {
                     control.resume();
                 }
-                if let ScanState::Paused { progress, status: _ } = &self.scan_state {
+                if let ScanState::Paused {
+                    progress,
+                    elapsed_secs,
+                    ..
+                } = &self.scan_state
+                {
                     self.scan_state = ScanState::Running {
                         progress: *progress,
                         status: "Resuming...".to_string(),
+                        elapsed_secs: *elapsed_secs,
+                        eta_secs: None,
                     };
                 }
             }
@@ -232,10 +258,14 @@ impl DuplicateFinderState {
                     current,
                     total,
                     message,
+                    elapsed_secs: msg_elapsed,
+                    eta_secs: msg_eta,
                 } => {
                     if let ScanState::Running {
                         ref mut progress,
                         ref mut status,
+                        ref mut elapsed_secs,
+                        ref mut eta_secs,
                     } = self.scan_state
                     {
                         *progress = if total > 0 {
@@ -244,6 +274,8 @@ impl DuplicateFinderState {
                             0.0
                         };
                         *status = message;
+                        *elapsed_secs = msg_elapsed;
+                        *eta_secs = msg_eta;
                     }
                 }
                 ScanProgress::PhaseCompleted { category, groups } => {
@@ -701,9 +733,24 @@ impl DuplicateFinderState {
 
         // Progress
         match &self.scan_state {
-            ScanState::Running { progress, status } | ScanState::Paused { progress, status } => {
+            ScanState::Running {
+                progress,
+                status,
+                elapsed_secs,
+                eta_secs,
+            }
+            | ScanState::Paused {
+                progress,
+                status,
+                elapsed_secs,
+                eta_secs,
+            } => {
                 content = content.push(progress_bar(0.0..=1.0, *progress).height(20));
-                content = content.push(text(status));
+                let mut timing = format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
+                if let Some(eta) = eta_secs {
+                    timing.push_str(&format!(" | ETA: {}", format_duration(*eta)));
+                }
+                content = content.push(text(timing));
             }
             _ => {}
         }
@@ -719,6 +766,20 @@ impl DuplicateFinderState {
 
 /// Render a preview image for PDFs (via pdftoppm) or videos (via ffmpeg).
 /// Returns the path to a temp PNG file, or None if rendering fails.
+fn format_duration(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 fn render_preview_image(
     file_path: &str,
     category: &FileCategory,

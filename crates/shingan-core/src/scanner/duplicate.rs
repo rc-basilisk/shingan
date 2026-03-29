@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Progress messages sent from the scanner to the UI.
 #[derive(Debug, Clone)]
@@ -18,6 +18,8 @@ pub enum ScanProgress {
         current: u32,
         total: u32,
         message: String,
+        elapsed_secs: f64,
+        eta_secs: Option<f64>,
     },
     PhaseCompleted {
         category: FileCategory,
@@ -87,6 +89,9 @@ pub struct DuplicateScanner {
     control: Arc<ScanControl>,
     similarity_threshold: f64,
     progress_tx: Sender<ScanProgress>,
+    /// Pre-cached signatures from a previous scan (keyed by file path string).
+    /// Files present here skip signature computation entirely.
+    cached_signatures: HashMap<String, String>,
 }
 
 impl DuplicateScanner {
@@ -103,7 +108,14 @@ impl DuplicateScanner {
             control,
             similarity_threshold,
             progress_tx,
+            cached_signatures: HashMap::new(),
         }
+    }
+
+    /// Set pre-cached signatures to skip recomputation for unchanged files.
+    pub fn with_cached_signatures(mut self, cached: HashMap<String, String>) -> Self {
+        self.cached_signatures = cached;
+        self
     }
 
     fn send(&self, msg: ScanProgress) {
@@ -113,11 +125,15 @@ impl DuplicateScanner {
     /// Run the full 3-phase scan on the given paths.
     ///
     /// Each path is a (directory, include_subdirs) tuple.
+    /// Returns (duplicate groups by category, newly computed signatures).
+    /// The new signatures are `(path_string, signature)` pairs that the caller
+    /// should persist to the signature cache for future rescans.
     pub fn scan_paths(
         &self,
         paths: &[(PathBuf, bool)],
-    ) -> HashMap<FileCategory, Vec<DuplicateGroup>> {
+    ) -> (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<(String, String)>) {
         let mut all_results: HashMap<FileCategory, Vec<DuplicateGroup>> = HashMap::new();
+        let mut all_new_signatures: Vec<(String, String)> = Vec::new();
 
         self.send(ScanProgress::Status(
             "Phase 1/3: Discovering files...".to_string(),
@@ -129,7 +145,7 @@ impl DuplicateScanner {
 
         for (path, include_subdirs) in paths {
             if self.control.is_stopped() {
-                return all_results;
+                return (all_results, all_new_signatures);
             }
 
             let result = self
@@ -165,7 +181,7 @@ impl DuplicateScanner {
 
         for category in &categories {
             if self.control.is_stopped() {
-                return all_results;
+                return (all_results, all_new_signatures);
             }
 
             let files = match files_by_category.get(category) {
@@ -184,7 +200,8 @@ impl DuplicateScanner {
                 files.len()
             )));
 
-            let groups = self.find_duplicates(files, detector.as_ref());
+            let (groups, new_sigs) = self.find_duplicates(files, detector.as_ref());
+            all_new_signatures.extend(new_sigs);
 
             if !groups.is_empty() {
                 self.send(ScanProgress::PhaseCompleted {
@@ -196,61 +213,107 @@ impl DuplicateScanner {
         }
 
         self.send(ScanProgress::Completed);
-        all_results
+        (all_results, all_new_signatures)
     }
 
     /// Phase 2: Compute signatures and find duplicate groups for a single category.
-    fn find_duplicates(&self, files: &[FileInfo], detector: &dyn Detector) -> Vec<DuplicateGroup> {
-        // 2a: Compute signatures in parallel using rayon
+    /// Returns (groups, newly_computed_signatures) where newly_computed_signatures
+    /// contains (path_string, signature) pairs for the caller to persist.
+    fn find_duplicates(
+        &self,
+        files: &[FileInfo],
+        detector: &dyn Detector,
+    ) -> (Vec<DuplicateGroup>, Vec<(String, String)>) {
+        // 2a: Compute signatures in parallel using rayon, using cache when available
         let control = self.control.clone();
         let file_count = files.len() as u32;
         let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let phase_start = Instant::now();
+        let cached = &self.cached_signatures;
 
-        let signatures: Vec<(PathBuf, Option<String>)> = files
+        // (path, signature_option, was_cache_hit)
+        let signatures: Vec<(PathBuf, Option<String>, bool)> = files
             .par_iter()
             .filter(|_| !control.is_stopped())
             .map(|file| {
-                // Check pause/stop
                 if !control.wait_if_paused() {
-                    return (file.path.clone(), None);
+                    return (file.path.clone(), None, false);
                 }
 
-                let sig = detector.compute_signature(&file.path).ok().flatten();
+                let path_str = file.path.to_string_lossy();
+                let (sig, from_cache) =
+                    if let Some(cached_sig) = cached.get(path_str.as_ref()) {
+                        (Some(cached_sig.clone()), true)
+                    } else {
+                        (detector.compute_signature(&file.path).ok().flatten(), false)
+                    };
 
-                // Progress reporting with atomic counter (monotonically increasing)
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(10) || done == file_count {
+                    let elapsed = phase_start.elapsed().as_secs_f64();
+                    let eta = if done > 0 && done < file_count {
+                        Some(elapsed / done as f64 * (file_count - done) as f64)
+                    } else {
+                        None
+                    };
+                    let pct = (done as f64 / file_count as f64 * 100.0) as u32;
                     let _ = self.progress_tx.send(ScanProgress::Progress {
                         current: done,
                         total: file_count,
-                        message: format!("Computing signatures: {}/{}", done, file_count),
+                        message: format!(
+                            "Computing signatures: {}/{} ({}%)",
+                            done, file_count, pct
+                        ),
+                        elapsed_secs: elapsed,
+                        eta_secs: eta,
                     });
                 }
 
-                (file.path.clone(), sig)
+                (file.path.clone(), sig, from_cache)
             })
             .collect();
 
         if self.control.is_stopped() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
+
+        // Collect newly computed signatures for the caller to persist
+        let new_signatures: Vec<(String, String)> = signatures
+            .iter()
+            .filter(|(_, sig, from_cache)| !from_cache && sig.is_some())
+            .map(|(path, sig, _)| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    sig.as_ref().unwrap().clone(),
+                )
+            })
+            .collect();
+
+        let cache_hits: usize = signatures.iter().filter(|(_, _, hit)| *hit).count();
 
         // Build signature map (only successful signatures)
         let file_signatures: HashMap<PathBuf, String> = signatures
             .into_iter()
-            .filter_map(|(path, sig)| sig.map(|s| (path, s)))
+            .filter_map(|(path, sig, _)| sig.map(|s| (path, s)))
             .collect();
 
-        self.send(ScanProgress::Status(format!(
-            "Phase 2/3: Computed {} signatures, finding duplicates...",
-            file_signatures.len()
-        )));
+        if cache_hits > 0 {
+            self.send(ScanProgress::Status(format!(
+                "Phase 2/3: {} signatures ({} cached, {} computed), finding duplicates...",
+                file_signatures.len(),
+                cache_hits,
+                file_signatures.len() - cache_hits,
+            )));
+        } else {
+            self.send(ScanProgress::Status(format!(
+                "Phase 2/3: Computed {} signatures, finding duplicates...",
+                file_signatures.len()
+            )));
+        }
 
         // Find duplicate groups.
-        // Categories that support fuzzy matching use ONLY fuzzy matching
-        // (which naturally catches exact matches at similarity 1.0).
-        // Archives use exact matching only (SHA256 comparison).
         let category = detector.category();
+        let phase3_start = Instant::now();
         let all_groups = match category {
             FileCategory::Image
             | FileCategory::Video
@@ -263,10 +326,26 @@ impl DuplicateScanner {
                     self.similarity_threshold,
                     8, // prefix length
                     Some(&|done, total| {
+                        let elapsed = phase3_start.elapsed().as_secs_f64();
+                        let eta = if done > 0 && done < total {
+                            Some(elapsed / done as f64 * (total - done) as f64)
+                        } else {
+                            None
+                        };
+                        let pct = if total > 0 {
+                            (done as f64 / total as f64 * 100.0) as u32
+                        } else {
+                            0
+                        };
                         let _ = progress_tx.send(ScanProgress::Progress {
                             current: done as u32,
                             total: total as u32,
-                            message: format!("Comparing signatures: {}/{}", done, total),
+                            message: format!(
+                                "Comparing signatures: {}/{} ({}%)",
+                                done, total, pct
+                            ),
+                            elapsed_secs: elapsed,
+                            eta_secs: eta,
                         });
                     }),
                 )
@@ -274,6 +353,6 @@ impl DuplicateScanner {
             FileCategory::Archive => grouping::find_exact_groups(&file_signatures),
         };
 
-        all_groups
+        (all_groups, new_signatures)
     }
 }
