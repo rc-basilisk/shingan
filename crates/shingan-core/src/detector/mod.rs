@@ -26,6 +26,7 @@ pub trait Detector: Send + Sync {
 
     /// Compare two pre-computed signatures. Returns similarity in `0.0..=1.0`.
     /// Default implementation: exact match (1.0) or no match (0.0).
+    #[must_use]
     fn compare_signatures(&self, sig1: &str, sig2: &str) -> f64 {
         if sig1 == sig2 {
             1.0

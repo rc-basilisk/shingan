@@ -15,9 +15,17 @@ pub struct VideoDetector {
 
 impl VideoDetector {
     pub fn new(threshold: f64) -> Self {
+        Self::with_sampling(threshold, 3.0, 20.0)
+    }
+
+    /// Create a video detector with custom sampling parameters.
+    ///
+    /// - `skip_secs`: seconds to skip at the start of the video (e.g. intro).
+    /// - `duration_secs`: how many seconds of the video to sample for hashing.
+    pub fn with_sampling(threshold: f64, skip_secs: f64, duration_secs: f64) -> Self {
         let options = vid_dup_finder_lib::CreationOptions {
-            skip_forward_amount: 3.0,
-            duration: 20.0,
+            skip_forward_amount: skip_secs,
+            duration: duration_secs,
             ..Default::default()
         };
 

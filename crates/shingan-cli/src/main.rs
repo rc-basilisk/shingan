@@ -1,7 +1,7 @@
 //! CLI entry point for shingan (心眼), a multi-modal duplicate file detector.
 //!
-//! Provides the `scan`, `list`, and `export` subcommands. Run `shingan --help`
-//! for usage details.
+//! Provides the `scan`, `list`, `export`, `sort`, and `delete` subcommands.
+//! Run `shingan --help` for usage details.
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -41,6 +41,14 @@ enum Commands {
         /// Don't recurse into subdirectories
         #[arg(long)]
         no_recursive: bool,
+
+        /// Merge results into an existing scan session instead of creating a new one
+        #[arg(long)]
+        merge_session: Option<i64>,
+
+        /// Give this scan session a name
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List scan sessions
@@ -49,7 +57,7 @@ enum Commands {
         session_id: Option<i64>,
     },
 
-    /// Export scan results to CSV
+    /// Export scan results to CSV or JSON
     Export {
         /// Session ID to export
         session_id: i64,
@@ -57,6 +65,10 @@ enum Commands {
         /// Output file path
         #[arg(short, long, default_value = "results.csv")]
         output: PathBuf,
+
+        /// Output format (csv or json)
+        #[arg(short, long, default_value = "csv")]
+        format: String,
     },
 
     /// Sort files into category directories
@@ -72,7 +84,34 @@ enum Commands {
         /// Use local ML to sub-categorize images
         #[arg(long)]
         classify: bool,
+
+        /// Show what would be moved without actually moving
+        #[arg(long)]
+        dry_run: bool,
     },
+
+    /// Delete duplicate files from a scan session
+    Delete {
+        /// Session ID to delete duplicates from
+        session_id: i64,
+
+        /// Strategy: keep newest, oldest, or largest file in each group
+        #[arg(long, default_value = "newest", value_parser = parse_keep_strategy)]
+        keep: shingan_db::models::KeepStrategy,
+
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn parse_keep_strategy(s: &str) -> Result<shingan_db::models::KeepStrategy, String> {
+    match s.to_lowercase().as_str() {
+        "newest" => Ok(shingan_db::models::KeepStrategy::Newest),
+        "oldest" => Ok(shingan_db::models::KeepStrategy::Oldest),
+        "largest" => Ok(shingan_db::models::KeepStrategy::Largest),
+        _ => Err(format!("Invalid strategy '{}'. Use: newest, oldest, largest", s)),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -85,14 +124,22 @@ fn main() -> anyhow::Result<()> {
             types,
             threshold,
             no_recursive,
-        } => cmd_scan(&db, paths, types, threshold, !no_recursive)?,
+            merge_session,
+            name,
+        } => cmd_scan(&db, paths, types, threshold, !no_recursive, merge_session, name)?,
         Commands::List { session_id } => cmd_list(&db, session_id)?,
-        Commands::Export { session_id, output } => cmd_export(&db, session_id, &output)?,
+        Commands::Export { session_id, output, format } => cmd_export(&db, session_id, &output, &format)?,
         Commands::Sort {
             paths,
             dest,
             classify,
-        } => cmd_sort(paths, dest, classify)?,
+            dry_run,
+        } => cmd_sort(paths, dest, classify, dry_run)?,
+        Commands::Delete {
+            session_id,
+            keep,
+            dry_run,
+        } => cmd_delete(&db, session_id, keep, dry_run)?,
     }
 
     Ok(())
@@ -104,6 +151,8 @@ fn cmd_scan(
     types: Vec<String>,
     threshold: f64,
     recursive: bool,
+    merge_session: Option<i64>,
+    name: Option<String>,
 ) -> anyhow::Result<()> {
     let categories: Vec<FileCategory> = types
         .iter()
@@ -114,15 +163,19 @@ fn cmd_scan(
         anyhow::bail!("No valid file types specified");
     }
 
-    let file_types_json =
-        serde_json::to_string(&types).context("Failed to serialize file types")?;
-    let session_id = db
-        .create_scan_session(
-            &format!("CLI scan {} paths", paths.len()),
-            &file_types_json,
-            threshold,
-        )
-        .context("Failed to create scan session")?;
+    let session_id = if let Some(existing_id) = merge_session {
+        // Verify the session exists
+        db.get_scan_session(existing_id)
+            .context("Merge target session not found")?;
+        eprintln!("Merging into existing session {}", existing_id);
+        existing_id
+    } else {
+        let file_types_json =
+            serde_json::to_string(&types).context("Failed to serialize file types")?;
+        let session_name = name.unwrap_or_else(|| format!("CLI scan {} paths", paths.len()));
+        db.create_scan_session(&session_name, &file_types_json, threshold)
+            .context("Failed to create scan session")?
+    };
 
     db.update_session_status(session_id, "running").ok();
 
@@ -332,6 +385,35 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
             let groups = db
                 .get_duplicate_groups(id)
                 .context("Failed to get groups")?;
+
+            // Similarity histogram
+            if !groups.is_empty() {
+                let mut above_95 = 0u32;
+                let mut range_80_95 = 0u32;
+                let mut range_60_80 = 0u32;
+                let mut below_60 = 0u32;
+                for g in &groups {
+                    let pct = g.similarity_score * 100.0;
+                    if pct >= 95.0 {
+                        above_95 += 1;
+                    } else if pct >= 80.0 {
+                        range_80_95 += 1;
+                    } else if pct >= 60.0 {
+                        range_60_80 += 1;
+                    } else {
+                        below_60 += 1;
+                    }
+                }
+                println!("Similarity distribution ({} groups):", groups.len());
+                println!("  95-100%: {} groups", above_95);
+                println!("  80-95%:  {} groups", range_80_95);
+                println!("  60-80%:  {} groups", range_60_80);
+                if below_60 > 0 {
+                    println!("  <60%:    {} groups", below_60);
+                }
+                println!();
+            }
+
             for group in &groups {
                 println!(
                     "  Group {} [{}] - {:.1}% similar",
@@ -356,34 +438,68 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_export(db: &Database, session_id: i64, output: &PathBuf) -> anyhow::Result<()> {
+fn cmd_export(db: &Database, session_id: i64, output: &PathBuf, format: &str) -> anyhow::Result<()> {
     let groups = db
         .get_duplicate_groups(session_id)
         .context("Failed to get groups")?;
 
-    let mut csv =
-        String::from("group_id,file_type,similarity,file_path,file_size_bytes,modified_time\n");
-
-    for group in &groups {
-        let files = db
-            .get_file_entries(group.id)
-            .context("Failed to get files")?;
-        for f in &files {
-            csv.push_str(&format!(
-                "{},{},{:.4},\"{}\",{},{}\n",
-                group.id,
-                group.file_type,
-                group.similarity_score,
-                f.file_path.replace('"', "\"\""),
-                f.file_size,
-                f.modified_time.as_deref().unwrap_or(""),
-            ));
+    match format {
+        "json" => {
+            let mut json_groups = Vec::new();
+            for group in &groups {
+                let files = db
+                    .get_file_entries(group.id)
+                    .context("Failed to get files")?;
+                let json_files: Vec<serde_json::Value> = files
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "file_path": f.file_path,
+                            "file_size_bytes": f.file_size,
+                            "modified_time": f.modified_time,
+                        })
+                    })
+                    .collect();
+                json_groups.push(serde_json::json!({
+                    "group_id": group.id,
+                    "file_type": group.file_type,
+                    "similarity": group.similarity_score,
+                    "files": json_files,
+                }));
+            }
+            let json_output = serde_json::json!({
+                "session_id": session_id,
+                "groups": json_groups,
+            });
+            let content = serde_json::to_string_pretty(&json_output)
+                .context("Failed to serialize JSON")?;
+            std::fs::write(output, &content).context("Failed to write output file")?;
+        }
+        _ => {
+            let mut csv = String::from(
+                "group_id,file_type,similarity,file_path,file_size_bytes,modified_time\n",
+            );
+            for group in &groups {
+                let files = db
+                    .get_file_entries(group.id)
+                    .context("Failed to get files")?;
+                for f in &files {
+                    csv.push_str(&format!(
+                        "{},{},{:.4},\"{}\",{},{}\n",
+                        group.id,
+                        group.file_type,
+                        group.similarity_score,
+                        f.file_path.replace('"', "\"\""),
+                        f.file_size,
+                        f.modified_time.as_deref().unwrap_or(""),
+                    ));
+                }
+            }
+            std::fs::write(output, &csv).context("Failed to write output file")?;
         }
     }
 
-    std::fs::write(output, &csv).context("Failed to write output file")?;
-    println!("Exported {} groups to {}", groups.len(), output.display());
-
+    println!("Exported {} groups to {} ({})", groups.len(), output.display(), format);
     Ok(())
 }
 
@@ -476,8 +592,15 @@ fn cmd_sort(
     paths: Vec<PathBuf>,
     dest: PathBuf,
     classify: bool,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
-    let sorter = shingan_utils::auto_sorter::AutoSorter::new(paths, dest).with_ml(classify);
+    let sorter = shingan_utils::auto_sorter::AutoSorter::new(paths, dest)
+        .with_ml(classify)
+        .with_dry_run(dry_run);
+
+    if dry_run {
+        eprintln!("Dry run mode — no files will be moved.");
+    }
 
     let stats = sorter.sort_files(
         Some(&|current, total, filepath| {
@@ -494,10 +617,66 @@ fn cmd_sort(
     );
 
     eprintln!();
-    println!(
-        "Sort complete: {} moved, {} failed, {} skipped (of {} total)",
-        stats.moved, stats.failed, stats.skipped, stats.total
-    );
+    if dry_run {
+        println!(
+            "Dry run: {} would be moved, {} skipped (of {} total)",
+            stats.moved, stats.skipped, stats.total
+        );
+    } else {
+        println!(
+            "Sort complete: {} moved, {} failed, {} skipped (of {} total)",
+            stats.moved, stats.failed, stats.skipped, stats.total
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_delete(
+    db: &Database,
+    session_id: i64,
+    keep: shingan_db::models::KeepStrategy,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    // Verify session exists
+    let _session = db.get_scan_session(session_id).context("Session not found")?;
+    let strategy_name = match keep {
+        shingan_db::models::KeepStrategy::Newest => "newest",
+        shingan_db::models::KeepStrategy::Oldest => "oldest",
+        shingan_db::models::KeepStrategy::Largest => "largest",
+    };
+
+    if dry_run {
+        eprintln!(
+            "Dry run: would delete duplicates from session {} (keep {})",
+            session_id, strategy_name
+        );
+    } else {
+        eprintln!(
+            "Deleting duplicates from session {} (keep {})",
+            session_id, strategy_name
+        );
+    }
+
+    let (deleted, failed, actions) = db
+        .delete_duplicates(session_id, keep, dry_run)
+        .context("Failed to process deletions")?;
+
+    for action in &actions {
+        println!("  {}", action);
+    }
+
+    if dry_run {
+        println!(
+            "\nDry run complete: {} files would be deleted",
+            actions.len()
+        );
+    } else {
+        println!(
+            "\nDeletion complete: {} deleted, {} failed",
+            deleted, failed
+        );
+    }
 
     Ok(())
 }

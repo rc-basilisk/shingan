@@ -18,6 +18,8 @@ pub struct SettingsState {
     pub max_cloud_requests: String,
     pub ollama_url: String,
     pub vision_model: String,
+    pub video_skip_secs: String,
+    pub video_duration_secs: String,
     pub status_message: Option<String>,
     /// Per-model installed status, keyed by model ID.
     pub model_statuses: Vec<(String, bool)>,
@@ -90,6 +92,8 @@ pub enum SettingsMessage {
     MaxCloudRequestsChanged(String),
     OllamaUrlChanged(String),
     VisionModelChanged(String),
+    VideoSkipSecsChanged(String),
+    VideoDurationSecsChanged(String),
     StartDownload(String),
     CancelDownload,
     RemoveModel(String),
@@ -134,6 +138,8 @@ impl Default for SettingsState {
                 .unwrap_or_default(),
             ollama_url: settings.ollama_url,
             vision_model: settings.vision_model,
+            video_skip_secs: format!("{:.1}", settings.video_skip_secs),
+            video_duration_secs: format!("{:.1}", settings.video_duration_secs),
             status_message: None,
             model_statuses,
             download: DownloadState::Idle,
@@ -168,6 +174,8 @@ impl SettingsState {
             SettingsMessage::MaxCloudRequestsChanged(val) => self.max_cloud_requests = val,
             SettingsMessage::OllamaUrlChanged(val) => self.ollama_url = val,
             SettingsMessage::VisionModelChanged(val) => self.vision_model = val,
+            SettingsMessage::VideoSkipSecsChanged(val) => self.video_skip_secs = val,
+            SettingsMessage::VideoDurationSecsChanged(val) => self.video_duration_secs = val,
 
             SettingsMessage::StartDownload(model_id) => {
                 if let Some(model) = model_registry::find_model(&model_id) {
@@ -298,6 +306,8 @@ impl SettingsState {
                         Some(self.cloud_api_key.clone())
                     },
                     max_cloud_requests_per_session: self.max_cloud_requests.parse().ok(),
+                    video_skip_secs: self.video_skip_secs.parse().unwrap_or(3.0),
+                    video_duration_secs: self.video_duration_secs.parse().unwrap_or(20.0),
                 };
                 match save_settings(&settings) {
                     Ok(_) => self.status_message = Some("Settings saved!".to_string()),
@@ -346,6 +356,20 @@ impl SettingsState {
                         text("Thumbnail cache size (MB):").width(label_width),
                         text_input("500", &self.cache_size_mb)
                             .on_input(SettingsMessage::CacheSizeChanged)
+                            .width(100),
+                    ]
+                    .spacing(10),
+                    row![
+                        text("Video skip intro (secs):").width(label_width),
+                        text_input("3.0", &self.video_skip_secs)
+                            .on_input(SettingsMessage::VideoSkipSecsChanged)
+                            .width(100),
+                    ]
+                    .spacing(10),
+                    row![
+                        text("Video sample duration (secs):").width(label_width),
+                        text_input("20.0", &self.video_duration_secs)
+                            .on_input(SettingsMessage::VideoDurationSecsChanged)
                             .width(100),
                     ]
                     .spacing(10),
@@ -674,6 +698,12 @@ pub struct AppSettings {
     pub cloud_api_key: Option<String>,
     #[serde(default)]
     pub max_cloud_requests_per_session: Option<u32>,
+    /// Seconds to skip at the start of videos before sampling (default 3.0).
+    #[serde(default = "default_video_skip_secs")]
+    pub video_skip_secs: f64,
+    /// Duration in seconds to sample from videos for hashing (default 20.0).
+    #[serde(default = "default_video_duration_secs")]
+    pub video_duration_secs: f64,
 }
 
 fn default_ollama_url() -> String {
@@ -684,6 +714,12 @@ fn default_vision_model() -> String {
 }
 fn default_confidence_threshold() -> f32 {
     0.6
+}
+fn default_video_skip_secs() -> f64 {
+    3.0
+}
+fn default_video_duration_secs() -> f64 {
+    20.0
 }
 
 impl Default for AppSettings {
@@ -699,6 +735,8 @@ impl Default for AppSettings {
             cloud_provider: CloudProvider::default(),
             cloud_api_key: None,
             max_cloud_requests_per_session: None,
+            video_skip_secs: default_video_skip_secs(),
+            video_duration_secs: default_video_duration_secs(),
         }
     }
 }
@@ -743,6 +781,8 @@ mod tests {
         assert!(s.cloud_api_key.is_none());
         assert!(s.max_cloud_requests_per_session.is_none());
         assert!(s.ml_model_path.is_none());
+        assert!((s.video_skip_secs - 3.0).abs() < f64::EPSILON);
+        assert!((s.video_duration_secs - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]

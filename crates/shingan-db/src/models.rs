@@ -64,6 +64,17 @@ pub struct NewFileEntry<'a> {
     pub file_metadata: Option<&'a str>,
 }
 
+/// Strategy for which file to keep when batch-deleting duplicates.
+#[derive(Debug, Clone, Copy)]
+pub enum KeepStrategy {
+    /// Keep the most recently modified file.
+    Newest,
+    /// Keep the oldest file.
+    Oldest,
+    /// Keep the largest file.
+    Largest,
+}
+
 pub struct NewFileEntryBatch<'a> {
     pub file_path: &'a str,
     pub file_size: i64,

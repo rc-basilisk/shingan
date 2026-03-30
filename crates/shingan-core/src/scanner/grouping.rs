@@ -206,6 +206,7 @@ mod tests {
     use crate::file_info::FileCategory;
     use std::collections::HashMap;
     use std::path::Path;
+    use proptest::prelude::*;
 
     struct MockDetector {
         similarities: HashMap<(String, String), f64>,
@@ -348,6 +349,100 @@ mod tests {
         for g in &groups {
             assert_eq!(g.files.len(), 2);
             assert!((g.similarity - 1.0).abs() < f64::EPSILON);
+        }
+    }
+
+    // -- Property-based tests for union-find grouping invariants --
+
+    proptest! {
+        /// Every file must appear in at most one group (no orphan duplication).
+        #[test]
+        fn prop_no_file_in_multiple_groups(n in 2..20usize) {
+            let pairs: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("{}.png", i), format!("sig_{:04}", i)))
+                .collect();
+            let sigs: HashMap<PathBuf, String> = pairs
+                .iter()
+                .map(|(p, s)| (PathBuf::from(p), s.clone()))
+                .collect();
+            let groups = find_exact_groups(&sigs);
+            let mut seen = HashSet::new();
+            for group in &groups {
+                for file in &group.files {
+                    prop_assert!(
+                        seen.insert(file.clone()),
+                        "File {:?} appeared in multiple groups",
+                        file
+                    );
+                }
+            }
+        }
+
+        /// Every group must have >= 2 members.
+        #[test]
+        fn prop_groups_have_at_least_two(
+            n in 2..15usize,
+            num_sigs in 1..5usize,
+        ) {
+            // Create n files with num_sigs distinct signatures (so some will share)
+            let pairs: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("{}.png", i), format!("sig_{:04}", i % num_sigs)))
+                .collect();
+            let sigs: HashMap<PathBuf, String> = pairs
+                .iter()
+                .map(|(p, s)| (PathBuf::from(p), s.clone()))
+                .collect();
+            let groups = find_exact_groups(&sigs);
+            for group in &groups {
+                prop_assert!(
+                    group.files.len() >= 2,
+                    "Group has {} files, expected >= 2",
+                    group.files.len()
+                );
+            }
+        }
+
+        /// Similarity scores are within [0.0, 1.0].
+        #[test]
+        fn prop_similarity_bounded(
+            n in 2..10usize,
+            num_sigs in 1..4usize,
+        ) {
+            let pairs: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("{}.png", i), format!("sig_{:04}", i % num_sigs)))
+                .collect();
+            let sigs: HashMap<PathBuf, String> = pairs
+                .iter()
+                .map(|(p, s)| (PathBuf::from(p), s.clone()))
+                .collect();
+            let detector = MockDetector::new();
+            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+            for group in &groups {
+                prop_assert!(
+                    group.similarity >= 0.0 && group.similarity <= 1.0,
+                    "Similarity {} out of bounds",
+                    group.similarity
+                );
+            }
+        }
+
+        /// Union-find transitivity: if A and B are in the same group, and B and C are in the
+        /// same group, then A and C must be in the same group.
+        #[test]
+        fn prop_transitive_groups(n in 3..12usize) {
+            // All files share the same signature => one big group
+            let pairs: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("{}.png", i), "same_sig".to_string()))
+                .collect();
+            let sigs: HashMap<PathBuf, String> = pairs
+                .iter()
+                .map(|(p, s)| (PathBuf::from(p), s.clone()))
+                .collect();
+            let detector = MockDetector::new();
+            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+            // All files should be in a single group
+            prop_assert_eq!(groups.len(), 1);
+            prop_assert_eq!(groups[0].files.len(), n);
         }
     }
 }

@@ -13,6 +13,7 @@ pub struct AutoSorter {
     destination: PathBuf,
     extension_map: ExtensionMap,
     use_ml: bool,
+    dry_run: bool,
     pipeline_config: PipelineConfig,
 }
 
@@ -32,12 +33,19 @@ impl AutoSorter {
             destination,
             extension_map: ExtensionMap::new(),
             use_ml: false,
+            dry_run: false,
             pipeline_config: PipelineConfig::default(),
         }
     }
 
     pub fn with_ml(mut self, enable: bool) -> Self {
         self.use_ml = enable;
+        self
+    }
+
+    /// Enable dry-run mode: compute destinations but don't actually move files.
+    pub fn with_dry_run(mut self, enable: bool) -> Self {
+        self.dry_run = enable;
         self
     }
 
@@ -124,15 +132,26 @@ impl AutoSorter {
 
             let dest_path = resolve_conflict(&dest_dir, &file_name);
 
-            match std::fs::rename(file_path, &dest_path) {
-                Ok(_) => stats.moved += 1,
-                Err(_) => match std::fs::copy(file_path, &dest_path) {
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(file_path);
-                        stats.moved += 1;
-                    }
-                    Err(_) => stats.failed += 1,
-                },
+            if self.dry_run {
+                if let Some(cb) = status {
+                    cb(&format!(
+                        "  {} -> {}",
+                        file_path.display(),
+                        dest_path.display()
+                    ));
+                }
+                stats.moved += 1;
+            } else {
+                match std::fs::rename(file_path, &dest_path) {
+                    Ok(_) => stats.moved += 1,
+                    Err(_) => match std::fs::copy(file_path, &dest_path) {
+                        Ok(_) => {
+                            let _ = std::fs::remove_file(file_path);
+                            stats.moved += 1;
+                        }
+                        Err(_) => stats.failed += 1,
+                    },
+                }
             }
         }
 

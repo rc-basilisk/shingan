@@ -9,6 +9,7 @@ use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
 use shingan_db::Database;
 use iced::widget::{button, column, container, row, text, Rule};
+use iced::keyboard;
 use iced::{Element, Length, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,11 +38,20 @@ pub enum Message {
     Finder(FinderMessage),
     Sorter(SorterMessage),
     Settings(SettingsMessage),
+    KeyPressed(keyboard::Key, keyboard::Modifiers),
 }
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let db = Database::open(None).expect("Failed to open database");
+        let db = match Database::open(None) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Fatal: failed to open database: {e}");
+                eprintln!("Falling back to in-memory database. Data will not persist.");
+                Database::open(Some(std::path::Path::new(":memory:")))
+                    .expect("in-memory database must succeed")
+            }
+        };
 
         (
             Self {
@@ -113,6 +123,34 @@ impl App {
                 }
 
                 self.finder.update(msg).map(Message::Finder)
+            }
+            Message::KeyPressed(key, modifiers) => {
+                if modifiers.control() {
+                    match key.as_ref() {
+                        keyboard::Key::Character("1") => {
+                            self.active_tab = Tab::DuplicateFinder;
+                        }
+                        keyboard::Key::Character("2") => {
+                            self.active_tab = Tab::AutoSorter;
+                        }
+                        keyboard::Key::Character("3") => {
+                            self.active_tab = Tab::Settings;
+                        }
+                        keyboard::Key::Character("t") => {
+                            self.theme = self.theme.toggle();
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            if self.active_tab == Tab::DuplicateFinder
+                                && !self.finder.paths.is_empty()
+                                && matches!(self.finder.scan_state, ScanState::Idle | ScanState::Completed)
+                            {
+                                return self.update(Message::Finder(FinderMessage::StartScan));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Task::none()
             }
             Message::Sorter(msg) => self.sorter.update(msg).map(Message::Sorter),
             Message::Settings(msg) => {
@@ -222,11 +260,14 @@ impl App {
                 let categories = self.finder.file_types.selected_categories();
                 let threshold = self.finder.threshold as f64 / 100.0;
                 let control = control.clone();
+                let settings = crate::tabs::settings::load_settings();
+                let video_skip = settings.video_skip_secs;
+                let video_duration = settings.video_duration_secs;
 
                 subs.push(
                     Subscription::run_with_id(
                         "scanner",
-                        scan_subscription(paths, categories, threshold, control, self.db.clone()),
+                        scan_subscription(paths, categories, threshold, control, self.db.clone(), video_skip, video_duration),
                     )
                     .map(|progress| Message::Finder(FinderMessage::ScanProgress(progress))),
                 );
@@ -276,6 +317,15 @@ impl App {
                 .map(Message::Sorter),
             );
         }
+
+        // Keyboard shortcuts
+        subs.push(keyboard::on_key_press(|key, modifiers| {
+            if modifiers.control() {
+                Some(Message::KeyPressed(key, modifiers))
+            } else {
+                None
+            }
+        }));
 
         Subscription::batch(subs)
     }
@@ -362,6 +412,8 @@ fn scan_subscription(
     threshold: f64,
     control: Arc<ScanControl>,
     db: Arc<Database>,
+    video_skip_secs: f64,
+    video_duration_secs: f64,
 ) -> impl futures::Stream<Item = ScanProgress> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
@@ -383,7 +435,7 @@ fn scan_subscription(
                     Some(Box::new(shingan_core::detector::document::DocumentDetector::new(threshold)))
                 }
                 FileCategory::Video => {
-                    Some(Box::new(shingan_core::detector::video::VideoDetector::new(threshold)))
+                    Some(Box::new(shingan_core::detector::video::VideoDetector::with_sampling(threshold, video_skip_secs, video_duration_secs)))
                 }
             };
             if let Some(d) = detector {

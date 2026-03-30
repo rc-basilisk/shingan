@@ -37,16 +37,20 @@ It ships as both a CLI tool and an Iced-based GUI application.
 - **Auto-sorter** — rule-based file organization with optional ML-powered image sub-categorization
 - **GUI with preview** — image thumbnails, syntax-highlighted code, PDF pages, video frames; paginated results (50 groups/page)
 - **SQLite persistence** — WAL mode, indexed queries, batch inserts with transactions, full scan history
-- **CSV export** — batch export results for external processing
+- **CSV and JSON export** — batch export results in CSV or structured JSON for external processing
+- **Batch deletion** — CLI command to delete duplicates by strategy (keep newest/oldest/largest) with dry-run support
+- **Incremental scanning** — merge new directories into an existing scan session
+- **Dry-run sort** — preview file moves without executing them
+- **Keyboard shortcuts** — Ctrl+1/2/3 tab switching, Ctrl+T theme toggle, Ctrl+Enter start scan
 - **Pause / resume / stop** — full scan lifecycle control
-- **Progress tracking** — elapsed time, ETA, and percentage displayed in both CLI and GUI
+- **Progress tracking** — elapsed time, ETA, cache hit stats, and similarity histogram in CLI output
 
 ## Detection Capabilities
 
 | Category | Algorithm | Details |
 |----------|-----------|---------|
 | Image | Multi-hash perceptual (aHash + pHash + dHash) | 12x12 bit hashes via `img_hash`; all three must agree; 5000-entry signature cache + 10000-entry parse cache |
-| Video | 3D DCT perceptual (`vid_dup_finder_lib` + FFmpeg) | Samples first 20s, skips 3s intro; 1000-entry signature cache + 2000-entry parse cache |
+| Video | 3D DCT perceptual (`vid_dup_finder_lib` + FFmpeg) | Configurable sampling window (default: skip 3s, sample 20s); 1000-entry signature cache + 2000-entry parse cache |
 | Document | Text extraction + Sorensen-Dice coefficient | Supports PDF, DOCX, ODT, TXT, SRT, VTT, SUB, RTF |
 | Code | Normalization + Sorensen-Dice coefficient | Strips comments and whitespace; syntax-aware comparison |
 | Archive | SHA-256 exact match | Byte-for-byte content comparison |
@@ -137,8 +141,8 @@ ML pipeline (on `shingan-ml`):
 |------|--------|
 | `onnx` (default) | Local CLIP inference via ONNX Runtime |
 | `cloud-ollama` | Ollama vision API categorizer |
-| `cloud-openai` | OpenAI vision API categorizer (stub) |
-| `cloud-gemini` | Google Gemini vision API categorizer (stub) |
+| `cloud-openai` | OpenAI vision API categorizer |
+| `cloud-gemini` | Google Gemini vision API categorizer |
 
 ## Usage
 
@@ -148,18 +152,34 @@ ML pipeline (on `shingan-ml`):
 # Scan directories for image and document duplicates with 95% similarity threshold
 shingan scan ~/Photos ~/Documents -t image,document -T 0.95
 
+# Scan with a custom session name
+shingan scan ~/Photos -t image --name "Photo cleanup March 2026"
+
+# Merge new directories into an existing scan session
+shingan scan ~/MorePhotos -t image --merge-session 1
+
 # Sort files into category directories
 shingan sort ~/Downloads --dest ~/Sorted
 
 # Sort with ML-powered image sub-categorization
 shingan sort ~/Downloads --dest ~/Sorted --classify
 
-# List results from previous scans
+# Preview sort results without moving files
+shingan sort ~/Downloads --dest ~/Sorted --dry-run
+
+# List results from previous scans (includes similarity histogram)
 shingan list
 shingan list <SESSION_ID>
 
-# Export a scan session to CSV
+# Export a scan session to CSV or JSON
 shingan export <SESSION_ID> -o results.csv
+shingan export <SESSION_ID> -o results.json -f json
+
+# Delete duplicates, keeping the newest file in each group
+shingan delete <SESSION_ID> --keep newest
+
+# Preview deletions without removing files
+shingan delete <SESSION_ID> --keep largest --dry-run
 ```
 
 ### GUI
@@ -173,11 +193,13 @@ The GUI provides tabbed access to the duplicate finder, auto-sorter, and setting
 
 The **Settings** tab lets you configure:
 
-- **Performance** — scanner threads and thumbnail cache size
+- **Performance** — scanner threads, thumbnail cache size, video sampling parameters (skip intro duration, sample length)
 - **Local ML** — model manager (download, remove, status), confidence threshold for tier escalation, custom model directory
 - **Cloud APIs** — cloud provider selection (Ollama/OpenAI/Gemini/Anthropic), API key input, Ollama URL + model name, max requests per session cost guardrail
 - **Database** — clear sessions, optimize/vacuum
 - **Cache** — clear thumbnail cache
+
+**Keyboard shortcuts:** Ctrl+1/2/3 switches tabs, Ctrl+T toggles the theme, Ctrl+Enter starts a scan.
 
 All settings persist to `~/.config/shingan/settings.json` and are applied on the next sort run.
 
@@ -193,7 +215,7 @@ shingan is organized as a Cargo workspace with six crates:
 | `shingan-ml` | Multi-tier image classification pipeline (heuristics, structure analysis, ONNX CLIP, cloud APIs) |
 | `shingan-db` | SQLite persistence layer (WAL mode, bundled via `rusqlite`) |
 | `shingan-utils` | File sorting utilities integrating `shingan-ml` for image sub-categorization |
-| `shingan-cli` | CLI binary (`shingan`) exposing scan, list, export, and sort commands |
+| `shingan-cli` | CLI binary (`shingan`) exposing scan, list, export, sort, and delete commands |
 | `shingan-gui` | Iced-based GUI with duplicate finder, auto-sorter, and settings tabs |
 
 ### Key design decisions

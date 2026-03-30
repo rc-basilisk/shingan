@@ -8,8 +8,9 @@
 //!
 //! - **Image** -- multi-hash perceptual hashing (aHash + pHash + dHash) with a
 //!   10 000-entry parse cache for fast pairwise comparison
-//! - **Video** -- 3-D DCT fingerprinting across sampled frames with a 2 000-entry
-//!   parse cache
+//! - **Video** -- 3-D DCT fingerprinting across sampled frames (configurable skip
+//!   and duration via [`detector::video::VideoDetector::with_sampling`]) with a
+//!   2 000-entry parse cache
 //! - **Document** -- text extraction followed by Sorensen-Dice coefficient comparison
 //! - **Code** -- whitespace/comment normalization with fuzzy matching
 //! - **Archive** -- byte-level SHA-256 for exact-match deduplication

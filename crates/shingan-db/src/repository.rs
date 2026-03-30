@@ -286,6 +286,96 @@ impl Database {
         })
     }
 
+    /// Get all file entries for a session (across all groups), with group info.
+    pub fn get_session_files(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<(DuplicateGroupRow, Vec<FileEntry>)>, DbError> {
+        let groups = self.get_duplicate_groups(session_id)?;
+        let mut result = Vec::new();
+        for group in groups {
+            let entries = self.get_file_entries(group.id)?;
+            result.push((group, entries));
+        }
+        Ok(result)
+    }
+
+    /// Delete files from disk based on a keep strategy, returning (deleted, failed) counts.
+    pub fn delete_duplicates(
+        &self,
+        session_id: i64,
+        keep: KeepStrategy,
+        dry_run: bool,
+    ) -> Result<(u32, u32, Vec<String>), DbError> {
+        let group_data = self.get_session_files(session_id)?;
+        let mut deleted = 0u32;
+        let mut failed = 0u32;
+        let mut actions = Vec::new();
+
+        for (group, entries) in &group_data {
+            if entries.len() < 2 {
+                continue;
+            }
+
+            let keep_idx = match keep {
+                KeepStrategy::Newest => entries
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, e)| {
+                        std::fs::metadata(&e.file_path)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0),
+                KeepStrategy::Oldest => entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| {
+                        std::fs::metadata(&e.file_path)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0),
+                KeepStrategy::Largest => entries
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, e)| e.file_size)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0),
+            };
+
+            for (i, entry) in entries.iter().enumerate() {
+                if i == keep_idx {
+                    continue;
+                }
+                if dry_run {
+                    actions.push(format!(
+                        "Would delete: {} ({:.2} MB) [group {} - {:.1}% similar]",
+                        entry.file_path,
+                        entry.file_size as f64 / 1_048_576.0,
+                        group.id,
+                        group.similarity_score * 100.0,
+                    ));
+                } else {
+                    match std::fs::remove_file(&entry.file_path) {
+                        Ok(_) => {
+                            deleted += 1;
+                            actions.push(format!("Deleted: {}", entry.file_path));
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            actions.push(format!("Failed: {} ({})", entry.file_path, e));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((deleted, failed, actions))
+    }
+
     // --- Signature Cache ---
 
     /// Look up cached signatures for files that haven't changed (same size + mtime).
@@ -573,6 +663,58 @@ mod tests {
         let groups = db.get_duplicate_groups(sid).unwrap();
         assert!(groups.is_empty());
         assert!(db.get_file_entries(gid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_session_list_format() {
+        let db = test_db();
+        db.create_scan_session("Photo cleanup", "[\"image\"]", 0.95).unwrap();
+        db.create_scan_session("Code review", "[\"code\"]", 0.90).unwrap();
+
+        let sessions = db.list_scan_sessions().unwrap();
+        let output: Vec<String> = sessions
+            .iter()
+            .map(|s| format!("{:<6} {:<12} {}", s.id, s.status, s.name))
+            .collect();
+        insta::assert_snapshot!(output.join("\n"), @r"
+        2      pending      Code review
+        1      pending      Photo cleanup
+        ");
+    }
+
+    #[test]
+    fn snapshot_group_detail_format() {
+        let db = test_db();
+        let sid = db.create_scan_session("test", "image", 0.9).unwrap();
+        let entries = [
+            NewFileEntryBatch { file_path: "/photos/beach.jpg", file_size: 2_500_000, modified_time: None, thumbnail_path: None, file_metadata: None },
+            NewFileEntryBatch { file_path: "/photos/beach_copy.jpg", file_size: 2_500_100, modified_time: None, thumbnail_path: None, file_metadata: None },
+        ];
+        let groups: [(&str, f64, Option<&str>, &[NewFileEntryBatch]); 1] = [
+            ("image", 0.97, None, &entries),
+        ];
+        db.insert_duplicate_groups_batch(sid, &groups).unwrap();
+
+        let db_groups = db.get_duplicate_groups(sid).unwrap();
+        let mut output = Vec::new();
+        for group in &db_groups {
+            output.push(format!(
+                "Group {} [{}] - {:.1}% similar",
+                group.id, group.file_type, group.similarity_score * 100.0
+            ));
+            let files = db.get_file_entries(group.id).unwrap();
+            for f in &files {
+                output.push(format!(
+                    "  {} ({:.2} MB)",
+                    f.file_path, f.file_size as f64 / 1_048_576.0
+                ));
+            }
+        }
+        insta::assert_snapshot!(output.join("\n"), @r"
+        Group 1 [image] - 97.0% similar
+          /photos/beach.jpg (2.38 MB)
+          /photos/beach_copy.jpg (2.38 MB)
+        ");
     }
 
     #[test]
