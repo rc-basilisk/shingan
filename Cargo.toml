@@ -65,7 +65,7 @@ iced = { version = "0.13", features = ["image", "tokio"] }
 rfd = "0.15"
 
 # ML / ONNX (local inference)
-ort = { version = "2.0.0-rc.12", features = ["dynamic-loading"] }
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
 ndarray = "0.17"
 
 # Internal crates
