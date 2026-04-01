@@ -149,6 +149,16 @@ jobs:
           $ffmpegDir = (Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1).FullName
           echo "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_ENV
           echo "$ffmpegDir\bin" >> $env:GITHUB_PATH
+      - name: Setup ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ortVer = "1.21.0"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v${ortVer}/onnxruntime-win-x64-${ortVer}.zip" -OutFile "onnxruntime.zip"
+          Expand-Archive -Path onnxruntime.zip -DestinationPath onnxruntime -Force
+          $ortDir = (Get-ChildItem -Path onnxruntime -Directory | Select-Object -First 1).FullName
+          echo "ORT_DIR=$ortDir" >> $env:GITHUB_ENV
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
@@ -227,24 +237,27 @@ jobs:
             rm -rf "$WORKDIR"
             echo "::endgroup::"
           done
-      - name: Bundle FFmpeg (Windows)
+      - name: Bundle FFmpeg + ONNX Runtime (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ffmpegDlls = Get-ChildItem -Path "$env:FFMPEG_DIR\bin" -Filter "*.dll" | Where-Object {
             $_.Name -match 'avcodec|avformat|avutil|swscale|swresample|avdevice|avfilter|postproc'
           }
+          $ortDll = Get-ChildItem -Path "$env:ORT_DIR\lib" -Filter "onnxruntime.dll" | Select-Object -First 1
+          $allDlls = @($ffmpegDlls)
+          if ($ortDll) { $allDlls += $ortDll }
           $archives = (dist print-upload-files-from-manifest --manifest dist-manifest.json) -split "`n" | Where-Object { $_ -match '\.zip$' }
           foreach ($archive in $archives) {
             $archive = $archive.Trim()
             if (-not $archive) { continue }
-            Write-Host "Bundling FFmpeg into $archive"
+            Write-Host "Bundling FFmpeg + ONNX Runtime into $archive"
             $extractDir = "bundle-temp"
             if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
             Expand-Archive -Path $archive -DestinationPath $extractDir -Force
             Get-ChildItem -Path $extractDir -Filter "*.exe" -Recurse | ForEach-Object {
               $destDir = $_.DirectoryName
-              $ffmpegDlls | ForEach-Object { Copy-Item $_.FullName -Destination $destDir -Force }
+              $allDlls | ForEach-Object { Copy-Item $_.FullName -Destination $destDir -Force }
             }
             $dirName = (Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1).Name
             Remove-Item $archive -Force
