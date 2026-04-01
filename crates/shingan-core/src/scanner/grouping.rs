@@ -204,9 +204,9 @@ mod tests {
     use crate::detector::Detector;
     use crate::error::Result;
     use crate::file_info::FileCategory;
+    use proptest::prelude::*;
     use std::collections::HashMap;
     use std::path::Path;
-    use proptest::prelude::*;
 
     struct MockDetector {
         similarities: HashMap<(String, String), f64>,

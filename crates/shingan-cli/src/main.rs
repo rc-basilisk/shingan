@@ -110,7 +110,10 @@ fn parse_keep_strategy(s: &str) -> Result<shingan_db::models::KeepStrategy, Stri
         "newest" => Ok(shingan_db::models::KeepStrategy::Newest),
         "oldest" => Ok(shingan_db::models::KeepStrategy::Oldest),
         "largest" => Ok(shingan_db::models::KeepStrategy::Largest),
-        _ => Err(format!("Invalid strategy '{}'. Use: newest, oldest, largest", s)),
+        _ => Err(format!(
+            "Invalid strategy '{}'. Use: newest, oldest, largest",
+            s
+        )),
     }
 }
 
@@ -126,9 +129,21 @@ fn main() -> anyhow::Result<()> {
             no_recursive,
             merge_session,
             name,
-        } => cmd_scan(&db, paths, types, threshold, !no_recursive, merge_session, name)?,
+        } => cmd_scan(
+            &db,
+            paths,
+            types,
+            threshold,
+            !no_recursive,
+            merge_session,
+            name,
+        )?,
         Commands::List { session_id } => cmd_list(&db, session_id)?,
-        Commands::Export { session_id, output, format } => cmd_export(&db, session_id, &output, &format)?,
+        Commands::Export {
+            session_id,
+            output,
+            format,
+        } => cmd_export(&db, session_id, &output, &format)?,
         Commands::Sort {
             paths,
             dest,
@@ -210,7 +225,10 @@ fn cmd_scan(
     let cached = load_cached_signatures_cli(db, &scan_paths, &categories);
     let cache_count = cached.len();
     if cache_count > 0 {
-        eprintln!("Loaded {} cached signatures from previous scans", cache_count);
+        eprintln!(
+            "Loaded {} cached signatures from previous scans",
+            cache_count
+        );
     }
 
     let scanner = DuplicateScanner::new(
@@ -438,7 +456,12 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_export(db: &Database, session_id: i64, output: &PathBuf, format: &str) -> anyhow::Result<()> {
+fn cmd_export(
+    db: &Database,
+    session_id: i64,
+    output: &PathBuf,
+    format: &str,
+) -> anyhow::Result<()> {
     let groups = db
         .get_duplicate_groups(session_id)
         .context("Failed to get groups")?;
@@ -471,8 +494,8 @@ fn cmd_export(db: &Database, session_id: i64, output: &PathBuf, format: &str) ->
                 "session_id": session_id,
                 "groups": json_groups,
             });
-            let content = serde_json::to_string_pretty(&json_output)
-                .context("Failed to serialize JSON")?;
+            let content =
+                serde_json::to_string_pretty(&json_output).context("Failed to serialize JSON")?;
             std::fs::write(output, &content).context("Failed to write output file")?;
         }
         _ => {
@@ -499,7 +522,12 @@ fn cmd_export(db: &Database, session_id: i64, output: &PathBuf, format: &str) ->
         }
     }
 
-    println!("Exported {} groups to {} ({})", groups.len(), output.display(), format);
+    println!(
+        "Exported {} groups to {} ({})",
+        groups.len(),
+        output.display(),
+        format
+    );
     Ok(())
 }
 
@@ -639,7 +667,9 @@ fn cmd_delete(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     // Verify session exists
-    let _session = db.get_scan_session(session_id).context("Session not found")?;
+    let _session = db
+        .get_scan_session(session_id)
+        .context("Session not found")?;
     let strategy_name = match keep {
         shingan_db::models::KeepStrategy::Newest => "newest",
         shingan_db::models::KeepStrategy::Oldest => "oldest",
@@ -729,9 +759,9 @@ fn persist_new_signatures_cli(
     let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
         .iter()
         .filter_map(|(path, sig)| {
-            file_meta
-                .get(path)
-                .map(|(size, mtime, cat)| (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str()))
+            file_meta.get(path).map(|(size, mtime, cat)| {
+                (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str())
+            })
         })
         .collect();
 

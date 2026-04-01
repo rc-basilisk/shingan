@@ -236,8 +236,16 @@ mod tests {
     #[test]
     fn confidence_values_are_valid() {
         let cases = vec![
-            StructureStats { mean_luma: 0.5, edge_energy: 0.4, hash_size: 8 },
-            StructureStats { mean_luma: 0.9, edge_energy: 0.1, hash_size: 8 },
+            StructureStats {
+                mean_luma: 0.5,
+                edge_energy: 0.4,
+                hash_size: 8,
+            },
+            StructureStats {
+                mean_luma: 0.9,
+                edge_energy: 0.1,
+                hash_size: 8,
+            },
         ];
         for stats in cases {
             if let Some((_, conf)) = classify(&dummy_path(), Some(stats)) {
@@ -249,6 +257,9 @@ mod tests {
     #[test]
     fn none_stats_and_nonexistent_path_returns_none() {
         let result = classify(&dummy_path(), None);
-        assert!(result.is_none(), "nonexistent file with no stats should return None");
+        assert!(
+            result.is_none(),
+            "nonexistent file with no stats should return None"
+        );
     }
 }

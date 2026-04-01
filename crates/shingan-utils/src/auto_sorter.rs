@@ -165,11 +165,7 @@ impl AutoSorter {
         stats
     }
 
-    fn classify_image(
-        &self,
-        path: &Path,
-        pipeline: &mut Option<TieredPipeline>,
-    ) -> Option<String> {
+    fn classify_image(&self, path: &Path, pipeline: &mut Option<TieredPipeline>) -> Option<String> {
         let pipeline = pipeline.as_mut()?;
         let mut info = FileInfo::from_path(path, FileCategory::Image).ok()?;
         info.enrich_metadata();

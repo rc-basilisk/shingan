@@ -228,8 +228,7 @@ impl SettingsState {
                     let dir = model_registry::resolve_models_dir(&self.ml_model_path);
                     match model_registry::remove_model(model, &dir) {
                         Ok(()) => {
-                            self.status_message =
-                                Some(format!("{} removed.", model.name));
+                            self.status_message = Some(format!("{} removed.", model.name));
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Remove failed: {}", e));
@@ -274,10 +273,7 @@ impl SettingsState {
                             DownloadState::Downloading { model_id, .. } => model_id.clone(),
                             _ => String::new(),
                         };
-                        self.download = DownloadState::Failed {
-                            model_id,
-                            error: e,
-                        };
+                        self.download = DownloadState::Failed { model_id, error: e };
                     }
                 }
                 self.model_statuses = refresh_model_statuses(&self.ml_model_path);
@@ -607,11 +603,9 @@ impl SettingsState {
             if model_id == model.id {
                 column![
                     text(format!("Download failed: {}", error)).size(12),
-                    row![
-                        button(text("Retry").size(11))
-                            .padding([3, 8])
-                            .on_press(SettingsMessage::StartDownload(model.id.to_string())),
-                    ],
+                    row![button(text("Retry").size(11))
+                        .padding([3, 8])
+                        .on_press(SettingsMessage::StartDownload(model.id.to_string())),],
                 ]
                 .spacing(4)
                 .into()
@@ -622,12 +616,10 @@ impl SettingsState {
             self.view_model_status_row(model, installed)
         };
 
-        container(
-            column![header, desc, status_row].spacing(4),
-        )
-        .padding([8, 12])
-        .width(Length::Fill)
-        .into()
+        container(column![header, desc, status_row].spacing(4))
+            .padding([8, 12])
+            .width(Length::Fill)
+            .into()
     }
 
     /// The idle status row for a model: "Installed [Remove]" or "Not installed [Download]".
@@ -798,6 +790,8 @@ mod tests {
             cloud_provider: CloudProvider::OpenAI,
             cloud_api_key: Some("sk-test-key-123".to_string()),
             max_cloud_requests_per_session: Some(100),
+            video_skip_secs: 3.0,
+            video_duration_secs: 20.0,
         };
         let json = serde_json::to_string(&s).unwrap();
         let s2: AppSettings = serde_json::from_str(&json).unwrap();
@@ -850,7 +844,9 @@ mod tests {
     fn settings_update_cloud_provider() {
         let mut state = SettingsState::default();
         assert_eq!(state.cloud_provider, CloudProvider::Ollama);
-        let _ = state.update(SettingsMessage::CloudProviderSelected(CloudProvider::OpenAI));
+        let _ = state.update(SettingsMessage::CloudProviderSelected(
+            CloudProvider::OpenAI,
+        ));
         assert_eq!(state.cloud_provider, CloudProvider::OpenAI);
     }
 
@@ -871,7 +867,9 @@ mod tests {
     #[test]
     fn settings_update_confidence_threshold() {
         let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::ConfidenceThresholdChanged("0.80".to_string()));
+        let _ = state.update(SettingsMessage::ConfidenceThresholdChanged(
+            "0.80".to_string(),
+        ));
         assert_eq!(state.confidence_threshold, "0.80");
     }
 

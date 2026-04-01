@@ -349,10 +349,30 @@ mod tests {
     #[test]
     fn confidence_values_in_valid_range() {
         let test_cases = vec![
-            ImageSignals { width: Some(1920), height: Some(1080), has_exif: false, file_size: 400_000 },
-            ImageSignals { width: Some(4000), height: Some(3000), has_exif: true, file_size: 4_000_000 },
-            ImageSignals { width: Some(1080), height: Some(1920), has_exif: false, file_size: 500_000 },
-            ImageSignals { width: Some(64), height: Some(64), has_exif: false, file_size: 4096 },
+            ImageSignals {
+                width: Some(1920),
+                height: Some(1080),
+                has_exif: false,
+                file_size: 400_000,
+            },
+            ImageSignals {
+                width: Some(4000),
+                height: Some(3000),
+                has_exif: true,
+                file_size: 4_000_000,
+            },
+            ImageSignals {
+                width: Some(1080),
+                height: Some(1920),
+                has_exif: false,
+                file_size: 500_000,
+            },
+            ImageSignals {
+                width: Some(64),
+                height: Some(64),
+                has_exif: false,
+                file_size: 4096,
+            },
         ];
         for s in &test_cases {
             if let Some((_, conf)) = classify(s) {

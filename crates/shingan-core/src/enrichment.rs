@@ -71,8 +71,12 @@ pub fn image_has_meaningful_exif(path: &Path) -> bool {
     }
 
     // GPS or lens info
-    if exif.get_field(Tag::GPSLatitude, exif::In::PRIMARY).is_some()
-        || exif.get_field(Tag::FocalLength, exif::In::PRIMARY).is_some()
+    if exif
+        .get_field(Tag::GPSLatitude, exif::In::PRIMARY)
+        .is_some()
+        || exif
+            .get_field(Tag::FocalLength, exif::In::PRIMARY)
+            .is_some()
     {
         return true;
     }

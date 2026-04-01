@@ -1,4 +1,6 @@
-use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, text, text_input, Rule};
+use iced::widget::{
+    button, checkbox, column, container, progress_bar, row, scrollable, text, text_input, Rule,
+};
 use iced::{Element, Length, Task};
 
 /// State for the Auto-Sorter tab.
@@ -26,8 +28,15 @@ pub enum SorterMessage {
     DestinationChanged(String),
     ToggleML(bool),
     StartSorting,
-    SortProgress { current: u64, total: u64, file: String },
-    SortCompleted { moved: u64, failed: u64 },
+    SortProgress {
+        current: u64,
+        total: u64,
+        file: String,
+    },
+    SortCompleted {
+        moved: u64,
+        failed: u64,
+    },
 }
 
 impl Default for AutoSorterState {
@@ -89,9 +98,17 @@ impl AutoSorterState {
                     status: "Starting...".to_string(),
                 };
             }
-            SorterMessage::SortProgress { current, total, file } => {
+            SorterMessage::SortProgress {
+                current,
+                total,
+                file,
+            } => {
                 self.sort_state = SortState::Running {
-                    progress: if total > 0 { current as f32 / total as f32 } else { 0.0 },
+                    progress: if total > 0 {
+                        current as f32 / total as f32
+                    } else {
+                        0.0
+                    },
                     status: format!("{}/{}: {}", current, total, file),
                 };
             }

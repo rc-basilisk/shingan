@@ -2,6 +2,9 @@
 name = "shingan-gui"
 version.workspace = true
 edition.workspace = true
+repository = "https://github.com/rc-basilisk/shingan"
+homepage = "https://github.com/rc-basilisk/shingan"
+description = "GUI for shingan - high-performance file deduplication and organization toolkit"
 
 [[bin]]
 name = "shingan-gui"

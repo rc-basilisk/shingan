@@ -74,16 +74,20 @@ impl ClipOnnxClassifier {
         let proto_bytes: &[u8] = if proto_path.is_file() {
             // Leak a Vec so we get a &'static [u8] matching the embedded branch.
             // This only happens once per classifier load, so the leak is negligible.
-            Box::leak(std::fs::read(&proto_path).map_err(|e| e.to_string())?.into_boxed_slice())
+            Box::leak(
+                std::fs::read(&proto_path)
+                    .map_err(|e| e.to_string())?
+                    .into_boxed_slice(),
+            )
         } else {
             EMBEDDED_PROTOTYPES
         };
 
-        if proto_bytes.len() % 4 != 0 {
+        if !proto_bytes.len().is_multiple_of(4) {
             return Err("invalid prototype file size".into());
         }
         let n_floats = proto_bytes.len() / 4;
-        if n_floats % EXPECTED_PROTOTYPE_ROWS != 0 {
+        if !n_floats.is_multiple_of(EXPECTED_PROTOTYPE_ROWS) {
             return Err("prototype rows must match taxonomy".into());
         }
         let embed_dim = n_floats / EXPECTED_PROTOTYPE_ROWS;
@@ -91,9 +95,8 @@ impl ClipOnnxClassifier {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let prototypes =
-            Array2::from_shape_vec((EXPECTED_PROTOTYPE_ROWS, embed_dim), floats)
-                .map_err(|e| e.to_string())?;
+        let prototypes = Array2::from_shape_vec((EXPECTED_PROTOTYPE_ROWS, embed_dim), floats)
+            .map_err(|e| e.to_string())?;
 
         let session = Session::builder()
             .map_err(|e| e.to_string())?
@@ -112,9 +115,12 @@ impl ClipOnnxClassifier {
         let resized = image::imageops::resize(&img, 224, 224, FilterType::Triangle);
         let mut arr = Array4::<f32>::zeros((1, 3, 224, 224));
         for (x, y, p) in resized.enumerate_pixels() {
-            arr[[0, 0, y as usize, x as usize]] = (p[0] as f32 / 255.0 - CLIP_MEAN[0]) / CLIP_STD[0];
-            arr[[0, 1, y as usize, x as usize]] = (p[1] as f32 / 255.0 - CLIP_MEAN[1]) / CLIP_STD[1];
-            arr[[0, 2, y as usize, x as usize]] = (p[2] as f32 / 255.0 - CLIP_MEAN[2]) / CLIP_STD[2];
+            arr[[0, 0, y as usize, x as usize]] =
+                (p[0] as f32 / 255.0 - CLIP_MEAN[0]) / CLIP_STD[0];
+            arr[[0, 1, y as usize, x as usize]] =
+                (p[1] as f32 / 255.0 - CLIP_MEAN[1]) / CLIP_STD[1];
+            arr[[0, 2, y as usize, x as usize]] =
+                (p[2] as f32 / 255.0 - CLIP_MEAN[2]) / CLIP_STD[2];
         }
         Ok(arr)
     }

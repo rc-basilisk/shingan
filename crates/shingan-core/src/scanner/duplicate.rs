@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Duplicate groups keyed by category, plus newly computed `(path, signature)` pairs to persist.
-pub type ScanOutcome = (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<(String, String)>);
+pub type ScanOutcome = (
+    HashMap<FileCategory, Vec<DuplicateGroup>>,
+    Vec<(String, String)>,
+);
 
 /// Progress messages sent from the scanner to the UI.
 #[derive(Debug, Clone)]
@@ -131,10 +134,7 @@ impl DuplicateScanner {
     /// Returns (duplicate groups by category, newly computed signatures).
     /// The new signatures are `(path_string, signature)` pairs that the caller
     /// should persist to the signature cache for future rescans.
-    pub fn scan_paths(
-        &self,
-        paths: &[(PathBuf, bool)],
-    ) -> ScanOutcome {
+    pub fn scan_paths(&self, paths: &[(PathBuf, bool)]) -> ScanOutcome {
         let mut all_results: HashMap<FileCategory, Vec<DuplicateGroup>> = HashMap::new();
         let mut all_new_signatures: Vec<(String, String)> = Vec::new();
 
@@ -244,12 +244,11 @@ impl DuplicateScanner {
                 }
 
                 let path_str = file.path.to_string_lossy();
-                let (sig, from_cache) =
-                    if let Some(cached_sig) = cached.get(path_str.as_ref()) {
-                        (Some(cached_sig.clone()), true)
-                    } else {
-                        (detector.compute_signature(&file.path).ok().flatten(), false)
-                    };
+                let (sig, from_cache) = if let Some(cached_sig) = cached.get(path_str.as_ref()) {
+                    (Some(cached_sig.clone()), true)
+                } else {
+                    (detector.compute_signature(&file.path).ok().flatten(), false)
+                };
 
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(10) || done == file_count {
@@ -343,10 +342,7 @@ impl DuplicateScanner {
                         let _ = progress_tx.send(ScanProgress::Progress {
                             current: done as u32,
                             total: total as u32,
-                            message: format!(
-                                "Comparing signatures: {}/{} ({}%)",
-                                done, total, pct
-                            ),
+                            message: format!("Comparing signatures: {}/{} ({}%)", done, total, pct),
                             elapsed_secs: elapsed,
                             eta_secs: eta,
                         });

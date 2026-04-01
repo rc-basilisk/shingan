@@ -1,8 +1,10 @@
+use iced::widget::{
+    button, checkbox, column, container, progress_bar, row, scrollable, slider, text, Rule,
+};
+use iced::{Element, Length, Task};
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{ScanControl, ScanProgress};
 use shingan_core::scanner::grouping::DuplicateGroup;
-use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, slider, text, Rule};
-use iced::{Element, Length, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -297,8 +299,7 @@ impl DuplicateFinderState {
 
                     // Auto-show results if duplicates were found, otherwise notify
                     if let Some(ref mut results) = self.results {
-                        let total_groups: usize =
-                            results.groups.values().map(|g| g.len()).sum();
+                        let total_groups: usize = results.groups.values().map(|g| g.len()).sum();
                         let total_files: usize = results
                             .groups
                             .values()
@@ -389,14 +390,11 @@ impl DuplicateFinderState {
                                 continue;
                             }
                             // Find newest file by modification time
-                            let newest = group
-                                .files
-                                .iter()
-                                .max_by_key(|f| {
-                                    std::fs::metadata(f)
-                                        .and_then(|m| m.modified())
-                                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                                });
+                            let newest = group.files.iter().max_by_key(|f| {
+                                std::fs::metadata(f)
+                                    .and_then(|m| m.modified())
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                            });
                             // Select all except newest for deletion
                             for file in &group.files {
                                 if newest.map(|n| n != file).unwrap_or(false) {
@@ -426,9 +424,7 @@ impl DuplicateFinderState {
                             let largest = group
                                 .files
                                 .iter()
-                                .max_by_key(|f| {
-                                    std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)
-                                });
+                                .max_by_key(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0));
                             // Select all except largest for deletion
                             for file in &group.files {
                                 if largest.map(|l| l != file).unwrap_or(false) {
@@ -455,9 +451,9 @@ impl DuplicateFinderState {
                                 // Remove from groups
                                 for groups in results.groups.values_mut() {
                                     for group in groups.iter_mut() {
-                                        group.files.retain(|f| {
-                                            f.to_string_lossy() != path_str.as_str()
-                                        });
+                                        group
+                                            .files
+                                            .retain(|f| f.to_string_lossy() != path_str.as_str());
                                     }
                                 }
                             }
@@ -495,9 +491,7 @@ impl DuplicateFinderState {
                         for group in groups {
                             group_id += 1;
                             for file in &group.files {
-                                let size = std::fs::metadata(file)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
+                                let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
                                 csv.push_str(&format!(
                                     "{},{},{:.4},\"{}\",{}\n",
                                     group_id,
@@ -548,15 +542,11 @@ impl DuplicateFinderState {
             FinderMessage::OpenInExplorer(path) => {
                 let file_path = std::path::Path::new(&path);
                 if let Some(parent) = file_path.parent() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(parent)
-                        .spawn();
+                    let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
                 }
             }
             FinderMessage::OpenWithSystem(path) => {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&path)
-                    .spawn();
+                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
             }
             FinderMessage::ZoomIn => {
                 if let Some(ref mut results) = self.results {
@@ -717,9 +707,7 @@ impl DuplicateFinderState {
                     start = start.on_press(FinderMessage::StartScan);
                 }
                 let mut r = row![start].spacing(10);
-                if matches!(self.scan_state, ScanState::Completed)
-                    && self.results.is_some()
-                {
+                if matches!(self.scan_state, ScanState::Completed) && self.results.is_some() {
                     r = r.push(
                         button(text("View Results").size(14))
                             .padding([8, 24])
@@ -728,20 +716,24 @@ impl DuplicateFinderState {
                 }
                 r
             }
-            ScanState::Running { .. } => {
-                row![
-                    button(text("Pause").size(13)).padding([6, 16]).on_press(FinderMessage::PauseScan),
-                    button(text("Stop").size(13)).padding([6, 16]).on_press(FinderMessage::StopScan),
-                ]
-                .spacing(10)
-            }
-            ScanState::Paused { .. } => {
-                row![
-                    button(text("Resume").size(13)).padding([6, 16]).on_press(FinderMessage::ResumeScan),
-                    button(text("Stop").size(13)).padding([6, 16]).on_press(FinderMessage::StopScan),
-                ]
-                .spacing(10)
-            }
+            ScanState::Running { .. } => row![
+                button(text("Pause").size(13))
+                    .padding([6, 16])
+                    .on_press(FinderMessage::PauseScan),
+                button(text("Stop").size(13))
+                    .padding([6, 16])
+                    .on_press(FinderMessage::StopScan),
+            ]
+            .spacing(10),
+            ScanState::Paused { .. } => row![
+                button(text("Resume").size(13))
+                    .padding([6, 16])
+                    .on_press(FinderMessage::ResumeScan),
+                button(text("Stop").size(13))
+                    .padding([6, 16])
+                    .on_press(FinderMessage::StopScan),
+            ]
+            .spacing(10),
         };
         content = content.push(controls);
 
@@ -760,7 +752,8 @@ impl DuplicateFinderState {
                 eta_secs,
             } => {
                 let progress_section = {
-                    let mut timing = format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
+                    let mut timing =
+                        format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
                     if let Some(eta) = eta_secs {
                         timing.push_str(&format!(" | ETA: {}", format_duration(*eta)));
                     }
@@ -780,9 +773,7 @@ impl DuplicateFinderState {
 
         // -- Status message --
         if let Some(ref msg) = self.status_message {
-            content = content.push(
-                container(text(msg).size(14)).padding([8, 12]),
-            );
+            content = content.push(container(text(msg).size(14)).padding([8, 12]));
         }
 
         scrollable(container(content).width(Length::Fill)).into()
@@ -805,11 +796,7 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-fn render_preview_image(
-    file_path: &str,
-    category: &FileCategory,
-    page: usize,
-) -> Option<String> {
+fn render_preview_image(file_path: &str, category: &FileCategory, page: usize) -> Option<String> {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("shingan")
@@ -819,11 +806,7 @@ fn render_preview_image(
     match category {
         FileCategory::Document if file_path.ends_with(".pdf") => {
             // Use pdftoppm to render a specific page
-            let out_prefix = cache_dir.join(format!(
-                "pdf_{:x}_p{}",
-                simple_hash(file_path),
-                page
-            ));
+            let out_prefix = cache_dir.join(format!("pdf_{:x}_p{}", simple_hash(file_path), page));
             let out_file = format!("{}-{:06}.png", out_prefix.display(), page + 1);
 
             // Check cache
@@ -836,9 +819,12 @@ fn render_preview_image(
             let status = std::process::Command::new("pdftoppm")
                 .args([
                     "-png",
-                    "-r", "150",
-                    "-f", &first,
-                    "-l", &last,
+                    "-r",
+                    "150",
+                    "-f",
+                    &first,
+                    "-l",
+                    &last,
                     file_path,
                     &out_prefix.to_string_lossy(),
                 ])
@@ -872,10 +858,14 @@ fn render_preview_image(
 
             let status = std::process::Command::new("ffmpeg")
                 .args([
-                    "-ss", "5",
-                    "-i", file_path,
-                    "-vframes", "1",
-                    "-q:v", "2",
+                    "-ss",
+                    "5",
+                    "-i",
+                    file_path,
+                    "-vframes",
+                    "1",
+                    "-q:v",
+                    "2",
                     "-y",
                     &out_file.to_string_lossy(),
                 ])
@@ -914,11 +904,16 @@ pub fn video_thumbnail_path(video_path: &std::path::Path) -> Option<std::path::P
 
     let status = std::process::Command::new("ffmpeg")
         .args([
-            "-ss", "3",
-            "-i", &video_path.to_string_lossy(),
-            "-vframes", "1",
-            "-vf", "scale=280:-1",
-            "-q:v", "4",
+            "-ss",
+            "3",
+            "-i",
+            &video_path.to_string_lossy(),
+            "-vframes",
+            "1",
+            "-vf",
+            "scale=280:-1",
+            "-q:v",
+            "4",
             "-y",
             &out_file.to_string_lossy(),
         ])

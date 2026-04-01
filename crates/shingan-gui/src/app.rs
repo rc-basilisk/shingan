@@ -3,14 +3,14 @@ use crate::tabs::duplicate_finder::{DuplicateFinderState, FinderMessage, ScanSta
 use crate::tabs::settings::{DownloadState, SettingsMessage, SettingsState};
 use crate::theme::AppTheme;
 use crate::views::results_viewer;
+use iced::keyboard;
+use iced::widget::{button, column, container, row, text, Rule};
+use iced::{Element, Length, Subscription, Task, Theme};
 use shingan_core::detector::archive::ArchiveDetector;
 use shingan_core::detector::Detector;
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
 use shingan_db::Database;
-use iced::widget::{button, column, container, row, text, Rule};
-use iced::keyboard;
-use iced::{Element, Length, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,7 +142,10 @@ impl App {
                         keyboard::Key::Named(keyboard::key::Named::Enter) => {
                             if self.active_tab == Tab::DuplicateFinder
                                 && !self.finder.paths.is_empty()
-                                && matches!(self.finder.scan_state, ScanState::Idle | ScanState::Completed)
+                                && matches!(
+                                    self.finder.scan_state,
+                                    ScanState::Idle | ScanState::Completed
+                                )
                             {
                                 return self.update(Message::Finder(FinderMessage::StartScan));
                             }
@@ -158,8 +161,7 @@ impl App {
                 match &msg {
                     SettingsMessage::ClearSessions => {
                         let count = self.db.clear_sessions().unwrap_or(0);
-                        self.settings.status_message =
-                            Some(format!("Cleared {} sessions", count));
+                        self.settings.status_message = Some(format!("Cleared {} sessions", count));
                         return Task::none();
                     }
                     SettingsMessage::OptimizeDb => {
@@ -168,10 +170,7 @@ impl App {
                                 self.settings.status_message =
                                     Some("Database optimized!".to_string())
                             }
-                            Err(e) => {
-                                self.settings.status_message =
-                                    Some(format!("Error: {}", e))
-                            }
+                            Err(e) => self.settings.status_message = Some(format!("Error: {}", e)),
                         }
                         return Task::none();
                     }
@@ -200,11 +199,8 @@ impl App {
         }
 
         let header = row![
-            text("shingan")
-                .size(24)
-                .font(iced::Font::MONOSPACE),
-            text("— File Deduplicator & Organizer")
-                .size(16),
+            text("shingan").size(24).font(iced::Font::MONOSPACE),
+            text("— File Deduplicator & Organizer").size(16),
             iced::widget::horizontal_space(),
             button(text(self.theme.toggle_label()).size(13))
                 .padding([4, 12])
@@ -267,7 +263,15 @@ impl App {
                 subs.push(
                     Subscription::run_with_id(
                         "scanner",
-                        scan_subscription(paths, categories, threshold, control, self.db.clone(), video_skip, video_duration),
+                        scan_subscription(
+                            paths,
+                            categories,
+                            threshold,
+                            control,
+                            self.db.clone(),
+                            video_skip,
+                            video_duration,
+                        ),
                     )
                     .map(|progress| Message::Finder(FinderMessage::ScanProgress(progress))),
                 );
@@ -367,7 +371,12 @@ impl App {
             })
             .collect();
 
-        let batch_refs: Vec<(&str, f64, Option<&str>, Vec<shingan_db::models::NewFileEntryBatch>)> = owned
+        let batch_refs: Vec<(
+            &str,
+            f64,
+            Option<&str>,
+            Vec<shingan_db::models::NewFileEntryBatch>,
+        )> = owned
             .iter()
             .map(|group| {
                 let entries: Vec<shingan_db::models::NewFileEntryBatch> = group
@@ -381,16 +390,29 @@ impl App {
                         file_metadata: None,
                     })
                     .collect();
-                (category.label(), group.similarity, None as Option<&str>, entries)
+                (
+                    category.label(),
+                    group.similarity,
+                    None as Option<&str>,
+                    entries,
+                )
             })
             .collect();
 
-        let batch_slices: Vec<(&str, f64, Option<&str>, &[shingan_db::models::NewFileEntryBatch])> = batch_refs
+        let batch_slices: Vec<(
+            &str,
+            f64,
+            Option<&str>,
+            &[shingan_db::models::NewFileEntryBatch],
+        )> = batch_refs
             .iter()
             .map(|(ft, sim, hv, entries)| (*ft, *sim, hv.as_deref(), entries.as_slice()))
             .collect();
 
-        if let Err(e) = self.db.insert_duplicate_groups_batch(session_id, &batch_slices) {
+        if let Err(e) = self
+            .db
+            .insert_duplicate_groups_batch(session_id, &batch_slices)
+        {
             eprintln!("Failed to persist duplicate groups: {e}");
         }
     }
@@ -425,18 +447,22 @@ fn scan_subscription(
         for cat in &categories {
             let detector: Option<Box<dyn Detector>> = match cat {
                 FileCategory::Archive => Some(Box::new(ArchiveDetector::new(threshold))),
-                FileCategory::Image => {
-                    Some(Box::new(shingan_core::detector::image::ImageDetector::new(threshold, 12)))
-                }
-                FileCategory::Code => {
-                    Some(Box::new(shingan_core::detector::code::CodeDetector::new(threshold)))
-                }
-                FileCategory::Document => {
-                    Some(Box::new(shingan_core::detector::document::DocumentDetector::new(threshold)))
-                }
-                FileCategory::Video => {
-                    Some(Box::new(shingan_core::detector::video::VideoDetector::with_sampling(threshold, video_skip_secs, video_duration_secs)))
-                }
+                FileCategory::Image => Some(Box::new(
+                    shingan_core::detector::image::ImageDetector::new(threshold, 12),
+                )),
+                FileCategory::Code => Some(Box::new(
+                    shingan_core::detector::code::CodeDetector::new(threshold),
+                )),
+                FileCategory::Document => Some(Box::new(
+                    shingan_core::detector::document::DocumentDetector::new(threshold),
+                )),
+                FileCategory::Video => Some(Box::new(
+                    shingan_core::detector::video::VideoDetector::with_sampling(
+                        threshold,
+                        video_skip_secs,
+                        video_duration_secs,
+                    ),
+                )),
             };
             if let Some(d) = detector {
                 detectors.insert(*cat, d);
@@ -446,14 +472,9 @@ fn scan_subscription(
         // Pre-load cached signatures from DB for all scan paths
         let cached_signatures = load_cached_signatures(&db, &paths, &categories);
 
-        let scanner = DuplicateScanner::new(
-            &categories,
-            detectors,
-            threshold,
-            control,
-            progress_tx,
-        )
-        .with_cached_signatures(cached_signatures);
+        let scanner =
+            DuplicateScanner::new(&categories, detectors, threshold, control, progress_tx)
+                .with_cached_signatures(cached_signatures);
 
         // Run scanner on blocking thread, collecting new signatures to persist
         let paths_clone = paths.clone();
@@ -608,9 +629,9 @@ fn persist_new_signatures(
     let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
         .iter()
         .filter_map(|(path, sig)| {
-            file_meta
-                .get(path)
-                .map(|(size, mtime, cat)| (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str()))
+            file_meta.get(path).map(|(size, mtime, cat)| {
+                (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str())
+            })
         })
         .collect();
 
@@ -753,9 +774,7 @@ fn download_subscription(
             }
         }
 
-        let _ = output
-            .send(SettingsMessage::DownloadComplete(Ok(())))
-            .await;
+        let _ = output.send(SettingsMessage::DownloadComplete(Ok(()))).await;
     })
 }
 
@@ -772,10 +791,9 @@ fn sort_subscription(
 
         let tx = progress_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let sorter =
-                shingan_utils::auto_sorter::AutoSorter::new(sources, destination)
-                    .with_ml(use_ml)
-                    .with_pipeline_config(pipeline_config);
+            let sorter = shingan_utils::auto_sorter::AutoSorter::new(sources, destination)
+                .with_ml(use_ml)
+                .with_pipeline_config(pipeline_config);
             let stats = sorter.sort_files(
                 Some(&|current, total, filepath| {
                     let _ = tx.send(SorterMessage::SortProgress {

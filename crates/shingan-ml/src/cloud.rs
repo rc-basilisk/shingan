@@ -194,7 +194,9 @@ pub fn openai_categorizer(api_key: &str, model: &str) -> HttpVisionCategorizer {
             })
         },
         extract_response: |json| {
-            json["choices"][0]["message"]["content"].as_str().map(String::from)
+            json["choices"][0]["message"]["content"]
+                .as_str()
+                .map(String::from)
         },
     }
 }
@@ -222,7 +224,9 @@ pub fn gemini_categorizer(api_key: &str, model: &str) -> HttpVisionCategorizer {
             })
         },
         extract_response: |json| {
-            json["candidates"][0]["content"]["parts"][0]["text"].as_str().map(String::from)
+            json["candidates"][0]["content"]["parts"][0]["text"]
+                .as_str()
+                .map(String::from)
         },
     }
 }

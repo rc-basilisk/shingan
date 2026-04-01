@@ -18,12 +18,12 @@
 //! [`ClassificationResult`] captures the chosen category, confidence score, and
 //! which tier produced the answer.
 
+use crate::cloud::CloudCategorizer;
+#[cfg(feature = "onnx")]
+use crate::onnx::ClipOnnxClassifier;
 use crate::taxonomy::ImageSubCategory;
 use crate::tier0::{self, ImageSignals};
 use crate::tier1;
-#[cfg(feature = "onnx")]
-use crate::onnx::ClipOnnxClassifier;
-use crate::cloud::CloudCategorizer;
 use std::path::Path;
 
 /// Result of classifying one image.
@@ -71,8 +71,7 @@ pub struct TieredPipeline {
 impl TieredPipeline {
     pub fn new(config: PipelineConfig) -> Self {
         #[cfg(feature = "onnx")]
-        let onnx = ClipOnnxClassifier::try_load(config.model_dir.as_deref())
-            .unwrap_or(None);
+        let onnx = ClipOnnxClassifier::try_load(config.model_dir.as_deref()).unwrap_or(None);
 
         Self {
             config,
@@ -191,11 +190,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
-    fn make_file_info(
-        dims: Option<(u32, u32)>,
-        has_exif: bool,
-        size: u64,
-    ) -> FileInfo {
+    fn make_file_info(dims: Option<(u32, u32)>, has_exif: bool, size: u64) -> FileInfo {
         FileInfo {
             path: PathBuf::from("/tmp/test.png"),
             size,

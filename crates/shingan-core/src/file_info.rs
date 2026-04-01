@@ -121,18 +121,12 @@ impl ExtensionMap {
     pub fn new() -> Self {
         let mut map = HashMap::new();
 
-        let image_exts = [
-            "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "svg",
-        ];
+        let image_exts = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "svg"];
         let document_exts = [
             "txt", "doc", "docx", "odt", "pdf", "rtf", "srt", "vtt", "sub",
         ];
-        let video_exts = [
-            "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v",
-        ];
-        let archive_exts = [
-            "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst",
-        ];
+        let video_exts = ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v"];
+        let archive_exts = ["zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst"];
         let code_exts = [
             "py", "js", "ts", "exs", "html", "css", "jsx", "tsx", "vue", "rs", "go", "cpp", "c",
             "h",

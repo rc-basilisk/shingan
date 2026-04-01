@@ -241,7 +241,9 @@ mod tests {
         for cat in &ImageSubCategory::ALL {
             let label = cat.label();
             assert!(
-                label.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
                 "label {label:?} is not snake_case"
             );
         }
@@ -314,7 +316,10 @@ mod tests {
 
     #[test]
     fn specific_label_values() {
-        assert_eq!(ImageSubCategory::ScreenshotDesktop.label(), "screenshot_desktop");
+        assert_eq!(
+            ImageSubCategory::ScreenshotDesktop.label(),
+            "screenshot_desktop"
+        );
         assert_eq!(ImageSubCategory::PhotoGeneral.label(), "photo_general");
         assert_eq!(ImageSubCategory::Render3d.label(), "render_3d");
         assert_eq!(ImageSubCategory::LogoIcon.label(), "logo_icon");
@@ -323,7 +328,10 @@ mod tests {
 
     #[test]
     fn specific_display_names() {
-        assert_eq!(ImageSubCategory::ScreenshotDesktop.display_name(), "Desktop screenshot");
+        assert_eq!(
+            ImageSubCategory::ScreenshotDesktop.display_name(),
+            "Desktop screenshot"
+        );
         assert_eq!(ImageSubCategory::Render3d.display_name(), "3D render");
         assert_eq!(ImageSubCategory::Other.display_name(), "Other");
     }

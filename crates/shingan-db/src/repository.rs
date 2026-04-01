@@ -29,10 +29,7 @@ impl Database {
             None => default_db_path(),
         };
 
-        if !db_path
-            .to_str()
-            .is_some_and(|s| s.starts_with(":memory:"))
-        {
+        if !db_path.to_str().is_some_and(|s| s.starts_with(":memory:")) {
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -445,10 +442,15 @@ impl Database {
             )?;
             let mut result = HashMap::new();
             for &(path, size, mtime) in files {
-                if let Ok((sub_cat, conf, tier)) = stmt.query_row(
-                    params![path, size, mtime],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?)),
-                ) {
+                if let Ok((sub_cat, conf, tier)) =
+                    stmt.query_row(params![path, size, mtime], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, f64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                {
                     result.insert(path.to_string(), (sub_cat, conf, tier));
                 }
             }
@@ -668,8 +670,10 @@ mod tests {
     #[test]
     fn snapshot_session_list_format() {
         let db = test_db();
-        db.create_scan_session("Photo cleanup", "[\"image\"]", 0.95).unwrap();
-        db.create_scan_session("Code review", "[\"code\"]", 0.90).unwrap();
+        db.create_scan_session("Photo cleanup", "[\"image\"]", 0.95)
+            .unwrap();
+        db.create_scan_session("Code review", "[\"code\"]", 0.90)
+            .unwrap();
 
         let sessions = db.list_scan_sessions().unwrap();
         let output: Vec<String> = sessions
@@ -687,12 +691,23 @@ mod tests {
         let db = test_db();
         let sid = db.create_scan_session("test", "image", 0.9).unwrap();
         let entries = [
-            NewFileEntryBatch { file_path: "/photos/beach.jpg", file_size: 2_500_000, modified_time: None, thumbnail_path: None, file_metadata: None },
-            NewFileEntryBatch { file_path: "/photos/beach_copy.jpg", file_size: 2_500_100, modified_time: None, thumbnail_path: None, file_metadata: None },
+            NewFileEntryBatch {
+                file_path: "/photos/beach.jpg",
+                file_size: 2_500_000,
+                modified_time: None,
+                thumbnail_path: None,
+                file_metadata: None,
+            },
+            NewFileEntryBatch {
+                file_path: "/photos/beach_copy.jpg",
+                file_size: 2_500_100,
+                modified_time: None,
+                thumbnail_path: None,
+                file_metadata: None,
+            },
         ];
-        let groups: [(&str, f64, Option<&str>, &[NewFileEntryBatch]); 1] = [
-            ("image", 0.97, None, &entries),
-        ];
+        let groups: [(&str, f64, Option<&str>, &[NewFileEntryBatch]); 1] =
+            [("image", 0.97, None, &entries)];
         db.insert_duplicate_groups_batch(sid, &groups).unwrap();
 
         let db_groups = db.get_duplicate_groups(sid).unwrap();
@@ -700,13 +715,16 @@ mod tests {
         for group in &db_groups {
             output.push(format!(
                 "Group {} [{}] - {:.1}% similar",
-                group.id, group.file_type, group.similarity_score * 100.0
+                group.id,
+                group.file_type,
+                group.similarity_score * 100.0
             ));
             let files = db.get_file_entries(group.id).unwrap();
             for f in &files {
                 output.push(format!(
                     "  {} ({:.2} MB)",
-                    f.file_path, f.file_size as f64 / 1_048_576.0
+                    f.file_path,
+                    f.file_size as f64 / 1_048_576.0
                 ));
             }
         }
