@@ -46,8 +46,9 @@ pub enum DownloadState {
 }
 
 /// Which cloud backend to use when cloud escalation is enabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CloudProvider {
+    #[default]
     Ollama,
     OpenAI,
     Gemini,
@@ -71,12 +72,6 @@ impl std::fmt::Display for CloudProvider {
             Self::Gemini => write!(f, "Google Gemini"),
             Self::Anthropic => write!(f, "Anthropic Claude"),
         }
-    }
-}
-
-impl Default for CloudProvider {
-    fn default() -> Self {
-        Self::Ollama
     }
 }
 
@@ -888,9 +883,10 @@ mod tests {
 
     #[test]
     fn settings_update_remove_nonexistent_model() {
-        let mut state = SettingsState::default();
-        // Removing from a nonexistent path should succeed (nothing to remove).
-        state.ml_model_path = "/tmp/shingan_test_nonexistent".to_string();
+        let mut state = SettingsState {
+            ml_model_path: "/tmp/shingan_test_nonexistent".to_string(),
+            ..Default::default()
+        };
         let _ = state.update(SettingsMessage::RemoveModel("clip-vit-b32".to_string()));
         assert!(state.status_message.is_some());
     }
