@@ -152,14 +152,31 @@ fn check_version(version: &str) -> Result<(), String> {
 }
 
 #[cfg(feature = "onnx")]
-static RUNTIME: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+static RUNTIME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+#[cfg(feature = "onnx")]
+static RUNTIME_ATTEMPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Load the ONNX Runtime shared library once. Returns where it was loaded from,
-/// or a human-readable error. Never panics.
+/// Load the ONNX Runtime shared library. Returns where it was loaded from, or a
+/// human-readable error. Never panics. Success is cached; failures are retried
+/// on the next call (so installing the runtime mid-session works).
 #[cfg(feature = "onnx")]
 pub fn ensure_runtime(model_dir: &Path) -> Result<String, String> {
-    RUNTIME
-        .get_or_init(|| {
+    if let Some(loc) = RUNTIME.get() {
+        return Ok(loc.clone());
+    }
+    let _guard = RUNTIME_ATTEMPT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(loc) = RUNTIME.get() {
+        return Ok(loc.clone());
+    }
+    let loc = load_runtime(model_dir)?;
+    let _ = RUNTIME.set(loc.clone());
+    Ok(loc)
+}
+
+#[cfg(feature = "onnx")]
+fn load_runtime(model_dir: &Path) -> Result<String, String> {
+    {
+        {
             let mut errors = Vec::new();
             let mut candidates: Vec<PathBuf> = Vec::new();
             if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
@@ -202,15 +219,16 @@ pub fn ensure_runtime(model_dir: &Path) -> Result<String, String> {
                 }
             }
             Err(runtime_error(&errors))
-        })
-        .clone()
+        }
+    }
 }
 
 #[cfg(feature = "onnx")]
 fn runtime_error(errors: &[String]) -> String {
     let mut msg = String::from(
-        "ONNX Runtime library not found. Release downloads include it next to the \
-         shingan binary; otherwise install ONNX Runtime 1.18+ or set ORT_DYLIB_PATH.",
+        "ONNX Runtime library not found. Downloading the model (Settings, or \
+         `shingan model download`) also fetches it; or install ONNX Runtime 1.18+ \
+         and set ORT_DYLIB_PATH.",
     );
     if !errors.is_empty() {
         msg.push_str(" Tried: ");

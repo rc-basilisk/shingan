@@ -29,6 +29,8 @@ pub struct SettingsState {
     pub download: DownloadState,
     /// Bumped on every download start so a retry restarts the subscription.
     pub download_generation: u64,
+    /// Set to abort the running download.
+    pub download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the app after a save; the app picks it up and applies it.
     pub saved: Option<AppSettings>,
     /// True when fields differ from what was last saved.
@@ -132,6 +134,7 @@ impl SettingsState {
             model_statuses,
             download: DownloadState::Idle,
             download_generation: 0,
+            download_cancel: Default::default(),
             saved: None,
             dirty: false,
             pending_action: None,
@@ -240,6 +243,7 @@ impl SettingsState {
                         };
                     } else {
                         self.download_generation += 1;
+                        self.download_cancel = Default::default();
                         self.download = DownloadState::Downloading {
                             model_id,
                             current_file: model
@@ -258,7 +262,10 @@ impl SettingsState {
             }
 
             SettingsMessage::CancelDownload => {
-                // Only remove the partial download; an installed copy stays untouched.
+                // Stop the transfer and remove only the partial file; an installed
+                // copy stays untouched.
+                self.download_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 if let DownloadState::Downloading { ref model_id, .. } = self.download {
                     if let Some(model) = model_registry::find_model(model_id) {
                         let dir = model_registry::resolve_models_dir(&self.ml_model_path);
@@ -276,6 +283,7 @@ impl SettingsState {
             SettingsMessage::RemoveModel(model_id) => {
                 if let Some(model) = model_registry::find_model(&model_id) {
                     let dir = model_registry::resolve_models_dir(&self.ml_model_path);
+                    model_registry::remove_runtime(&dir);
                     self.status_message = Some(match model_registry::remove_model(model, &dir) {
                         Ok(()) => format!("{} removed.", model.name),
                         Err(e) => format!("Remove failed: {}", e),

@@ -95,18 +95,190 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
     final_path.with_file_name(name)
 }
 
-/// Download every file of `model` into `models_dir` (blocking).
+/// ONNX Runtime release fetched alongside the model when no runtime is installed.
+pub const ORT_VERSION: &str = "1.22.0";
+
+/// Where to get the ONNX Runtime shared library for this platform.
+#[derive(Debug, Clone)]
+pub struct RuntimeAsset {
+    pub url: String,
+    /// Path suffix of the library inside the downloaded archive.
+    pub member_suffix: String,
+    /// File name to save it under (what the loader looks for).
+    pub file_name: &'static str,
+    pub is_zip: bool,
+}
+
+/// The ONNX Runtime download for the current OS/architecture, if one exists.
+pub fn runtime_asset() -> Option<RuntimeAsset> {
+    let v = ORT_VERSION;
+    let (platform, member, file_name, is_zip) =
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            (
+                "linux-x64",
+                format!("lib/libonnxruntime.so.{v}"),
+                "libonnxruntime.so",
+                false,
+            )
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            (
+                "linux-aarch64",
+                format!("lib/libonnxruntime.so.{v}"),
+                "libonnxruntime.so",
+                false,
+            )
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            (
+                "osx-arm64",
+                format!("lib/libonnxruntime.{v}.dylib"),
+                "libonnxruntime.dylib",
+                false,
+            )
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            (
+                "osx-x86_64",
+                format!("lib/libonnxruntime.{v}.dylib"),
+                "libonnxruntime.dylib",
+                false,
+            )
+        } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            (
+                "win-x64",
+                "lib/onnxruntime.dll".to_string(),
+                "onnxruntime.dll",
+                true,
+            )
+        } else {
+            return None;
+        };
+    let ext = if is_zip { "zip" } else { "tgz" };
+    Some(RuntimeAsset {
+        url: format!(
+            "https://github.com/microsoft/onnxruntime/releases/download/v{v}/onnxruntime-{platform}-{v}.{ext}"
+        ),
+        member_suffix: member,
+        file_name,
+        is_zip,
+    })
+}
+
+/// Whether a downloaded ONNX Runtime library is present in `models_dir`.
+pub fn runtime_downloaded(models_dir: &Path) -> bool {
+    runtime_asset().is_some_and(|a| models_dir.join(a.file_name).is_file())
+}
+
+/// Progress callback: `(item name, item index, item count, downloaded bytes, total bytes)`.
+pub type DownloadProgress<'a> = &'a dyn Fn(&str, usize, usize, u64, u64);
+
+#[cfg(feature = "cloud")]
+fn fetch(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    (label, index, count): (&str, usize, usize),
+    progress: DownloadProgress<'_>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let part = partial_path(dest);
+    let result = (|| {
+        let mut resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("{label}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{label}: HTTP {}", resp.status()));
+        }
+        let total = resp.content_length().unwrap_or(0);
+        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done = 0u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".to_string());
+            }
+            let n = resp.read(&mut buf).map_err(|e| format!("{label}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            done += n as u64;
+            progress(label, index, count, done, total);
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        if total > 0 && done != total {
+            return Err(format!(
+                "{label}: incomplete download ({done} of {total} bytes)"
+            ));
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => std::fs::rename(&part, dest).map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+/// Pull one file out of a `.tgz` or `.zip` archive.
+#[cfg(feature = "cloud")]
+fn extract_member(archive: &Path, suffix: &str, is_zip: bool, dest: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if is_zip {
+        let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let name = (0..zip.len())
+            .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+            .find(|n| n.ends_with(suffix))
+            .ok_or_else(|| format!("{suffix} not found in archive"))?;
+        zip.by_name(&name)
+            .map_err(|e| e.to_string())?
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+    } else {
+        let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        let mut found = false;
+        for entry in tar.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let path = entry
+                .path()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            if path.ends_with(suffix) && entry.header().entry_type().is_file() {
+                entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(format!("{suffix} not found in archive"));
+        }
+    }
+    let part = partial_path(dest);
+    std::fs::write(&part, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&part, dest).map_err(|e| e.to_string())
+}
+
+/// Download every file of `model` into `models_dir` (blocking), plus the ONNX
+/// Runtime library when `with_runtime` is true and none is there yet.
 ///
-/// `progress` receives `(file_name, downloaded_bytes, total_bytes)`; total is 0
-/// when the server doesn't report a length.
+/// Files are written to `<name>.part` and renamed when complete, so an
+/// interrupted download never looks installed. Setting `cancel` aborts.
 #[cfg(feature = "cloud")]
 pub fn download_model_blocking(
     model: &ModelDef,
     models_dir: &Path,
-    progress: &dyn Fn(&str, u64, u64),
+    with_runtime: bool,
+    progress: DownloadProgress<'_>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
-
     std::fs::create_dir_all(models_dir).map_err(|e| e.to_string())?;
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -114,46 +286,59 @@ pub fn download_model_blocking(
         .build()
         .map_err(|e| e.to_string())?;
 
-    for file in model.files {
+    let runtime = runtime_asset().filter(|_| with_runtime && !runtime_downloaded(models_dir));
+    let count = model.files.len() + usize::from(runtime.is_some());
+
+    for (i, file) in model.files.iter().enumerate() {
+        let target = models_dir.join(file.filename);
+        if target.is_file() {
+            continue;
+        }
         if file.url.is_empty() {
             return Err(format!("no download URL configured for {}", file.filename));
         }
-        let target = models_dir.join(file.filename);
-        let part = partial_path(&target);
-        let mut resp = client
-            .get(file.url)
-            .send()
-            .map_err(|e| format!("{}: {e}", file.filename))?;
-        if !resp.status().is_success() {
-            return Err(format!("{}: HTTP {}", file.filename, resp.status()));
-        }
-        let total = resp.content_length().unwrap_or(0);
-        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut done = 0u64;
-        loop {
-            let n = resp
-                .read(&mut buf)
-                .map_err(|e| format!("{}: {e}", file.filename))?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-            done += n as u64;
-            progress(file.filename, done, total);
-        }
-        out.flush().map_err(|e| e.to_string())?;
-        drop(out);
-        if total > 0 && done != total {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!(
-                "{}: incomplete download ({done} of {total} bytes)",
-                file.filename
-            ));
-        }
-        std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
+        fetch(
+            &client,
+            file.url,
+            &target,
+            (file.filename, i, count),
+            progress,
+            cancel,
+        )?;
+    }
+
+    if let Some(asset) = runtime {
+        let label = format!("ONNX Runtime {ORT_VERSION}");
+        let archive = models_dir.join(if asset.is_zip {
+            "onnxruntime.zip"
+        } else {
+            "onnxruntime.tgz"
+        });
+        fetch(
+            &client,
+            &asset.url,
+            &archive,
+            (&label, count - 1, count),
+            progress,
+            cancel,
+        )?;
+        let result = extract_member(
+            &archive,
+            &asset.member_suffix,
+            asset.is_zip,
+            &models_dir.join(asset.file_name),
+        );
+        let _ = std::fs::remove_file(&archive);
+        result?;
     }
     Ok(())
+}
+
+/// Delete the downloaded ONNX Runtime library (if any) from `models_dir`.
+pub fn remove_runtime(models_dir: &Path) {
+    if let Some(a) = runtime_asset() {
+        let _ = std::fs::remove_file(models_dir.join(a.file_name));
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +377,21 @@ mod tests {
     fn resolve_models_dir_custom_path() {
         let dir = resolve_models_dir("/custom/path");
         assert_eq!(dir, PathBuf::from("/custom/path"));
+    }
+
+    #[test]
+    fn runtime_asset_exists_for_this_platform() {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
+            let a = runtime_asset().expect("asset");
+            assert!(a.url.contains(ORT_VERSION));
+            assert!(a
+                .url
+                .starts_with("https://github.com/microsoft/onnxruntime/"));
+        }
     }
 
     #[test]

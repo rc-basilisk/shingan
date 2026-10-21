@@ -923,31 +923,63 @@ fn cmd_model(settings: &AppSettings, action: ModelAction) -> anyhow::Result<()> 
             );
         }
         ModelAction::Download => {
+            let need_runtime = shingan_ml::onnx::ensure_runtime(&dir).is_err();
             println!(
-                "Downloading {} ({}) to {}",
+                "Downloading {} ({}){} to {}",
                 model.name,
                 model.size_label,
+                if need_runtime {
+                    " and ONNX Runtime (~8 MB)"
+                } else {
+                    ""
+                },
                 dir.display()
             );
-            reg::download_model_blocking(model, &dir, &|name, done, total| {
-                if total > 0 {
-                    eprint!(
-                        "\r\x1b[2K{name}: {} / {} ({:.0}%)",
-                        format_size(done),
-                        format_size(total),
-                        done as f64 / total as f64 * 100.0
-                    );
-                } else {
-                    eprint!("\r\x1b[2K{name}: {}", format_size(done));
-                }
-                let _ = std::io::stderr().flush();
-            })
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            use std::io::IsTerminal;
+            let tty = std::io::stderr().is_terminal();
+            let last_pct = std::cell::Cell::new(u64::MAX);
+            reg::download_model_blocking(
+                model,
+                &dir,
+                need_runtime,
+                &|name, _i, _n, done, total| {
+                    // Without a terminal, print one line per 10%.
+                    if !tty {
+                        let pct = if total > 0 { done * 10 / total } else { 0 };
+                        if pct != last_pct.get() {
+                            last_pct.set(pct);
+                            eprintln!("{name}: {}%", pct * 10);
+                        }
+                        return;
+                    }
+                    if total > 0 {
+                        eprint!(
+                            "\r\x1b[2K{name}: {} / {} ({:.0}%)",
+                            format_size(done),
+                            format_size(total),
+                            done as f64 / total as f64 * 100.0
+                        );
+                    } else {
+                        eprint!("\r\x1b[2K{name}: {}", format_size(done));
+                    }
+                    let _ = std::io::stderr().flush();
+                },
+                &cancel,
+            )
             .map_err(anyhow::Error::msg)?;
             eprintln!();
-            println!("Done. Use `shingan sort --classify` to sort images into sub-folders.");
+            match shingan_ml::onnx::ClipOnnxClassifier::try_load(Some(&dir)) {
+                Ok(Some(_)) => {
+                    println!("Done. Use `shingan sort --classify` to sort images into sub-folders.")
+                }
+                Ok(None) => println!("Done, but the model file was not found afterwards."),
+                Err(e) => println!("Downloaded, but the model can't run yet: {e}"),
+            }
         }
         ModelAction::Remove => {
             reg::remove_model(model, &dir).map_err(anyhow::Error::msg)?;
+            reg::remove_runtime(&dir);
             println!("Removed {}.", model.name);
         }
     }

@@ -25,7 +25,6 @@ image.workspace = true
 crossbeam-channel.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
-reqwest.workspace = true
 futures = "0.3"
 syntect.workspace = true
 

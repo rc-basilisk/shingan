@@ -416,23 +416,19 @@ impl App {
         }
 
         if let DownloadState::Downloading { ref model_id, .. } = self.settings_tab.download {
-            if let Some(model) = shingan_ml::model_registry::find_model(model_id) {
-                let files: Vec<(String, String)> = model
-                    .files
-                    .iter()
-                    .map(|f| (f.filename.to_string(), f.url.to_string()))
-                    .collect();
-                let target_dir = shingan_ml::model_registry::resolve_models_dir(
-                    &self.settings_tab.ml_model_path,
-                );
-                subs.push(
-                    Subscription::run_with_id(
-                        ("model-download", self.settings_tab.download_generation),
-                        download_subscription(files, target_dir),
-                    )
-                    .map(Message::Settings),
-                );
-            }
+            let target_dir =
+                shingan_ml::model_registry::resolve_models_dir(&self.settings_tab.ml_model_path);
+            subs.push(
+                Subscription::run_with_id(
+                    ("model-download", self.settings_tab.download_generation),
+                    download_subscription(
+                        model_id.clone(),
+                        target_dir,
+                        self.settings_tab.download_cancel.clone(),
+                    ),
+                )
+                .map(Message::Settings),
+            );
         }
 
         if let SortState::Running { .. } = &self.sorter.sort_state {
@@ -629,79 +625,63 @@ fn scan_subscription(job: ScanJob) -> impl futures::Stream<Item = ScanProgress> 
     })
 }
 
-/// Download model files to `<name>.part`, renaming only when complete.
+/// Download the model (and ONNX Runtime if needed) on a blocking thread.
 fn download_subscription(
-    files: Vec<(String, String)>,
+    model_id: String,
     target_dir: PathBuf,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> impl futures::Stream<Item = SettingsMessage> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
 
-        let result: Result<(), String> = async {
-            std::fs::create_dir_all(&target_dir)
-                .map_err(|e| format!("Failed to create {}: {e}", target_dir.display()))?;
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let file_count = files.len();
+        let (tx, rx) = crossbeam_channel::unbounded::<SettingsMessage>();
+        tokio::task::spawn_blocking(move || {
+            let Some(model) = shingan_ml::model_registry::find_model(&model_id) else {
+                let _ = tx.send(SettingsMessage::DownloadComplete(Err(
+                    "unknown model".into()
+                )));
+                return;
+            };
+            let need_runtime = shingan_ml::onnx::ensure_runtime(&target_dir).is_err();
+            let last = std::sync::Mutex::new(std::time::Instant::now());
+            let progress_tx = tx.clone();
+            let result = shingan_ml::model_registry::download_model_blocking(
+                model,
+                &target_dir,
+                need_runtime,
+                &|name, index, count, done, total| {
+                    let mut last = last.lock().unwrap();
+                    if last.elapsed() >= std::time::Duration::from_millis(150) || done == total {
+                        *last = std::time::Instant::now();
+                        let _ = progress_tx.send(SettingsMessage::DownloadProgress {
+                            current_file: name.to_string(),
+                            file_index: index,
+                            file_count: count,
+                            downloaded: done,
+                            total,
+                        });
+                    }
+                },
+                &cancel,
+            );
+            let _ = tx.send(SettingsMessage::DownloadComplete(result));
+        });
 
-            for (file_index, (filename, url)) in files.iter().enumerate() {
-                if url.is_empty() {
-                    return Err(format!("No download URL configured for {filename}"));
-                }
-                let mut response = client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to download {filename}: {e}"))?;
-                if !response.status().is_success() {
-                    return Err(format!("{filename}: HTTP {}", response.status()));
-                }
-                let total = response.content_length().unwrap_or(0);
-                let target = target_dir.join(filename);
-                let part = shingan_ml::model_registry::partial_path(&target);
-                let mut file = std::fs::File::create(&part)
-                    .map_err(|e| format!("Failed to create {}: {e}", part.display()))?;
-
-                let mut downloaded: u64 = 0;
-                let mut last_update = std::time::Instant::now();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|e| format!("Download error for {filename}: {e}"))?
-                {
-                    use std::io::Write;
-                    file.write_all(&chunk)
-                        .map_err(|e| format!("Write error for {filename}: {e}"))?;
-                    downloaded += chunk.len() as u64;
-                    if last_update.elapsed() >= std::time::Duration::from_millis(150) {
-                        let _ = output
-                            .send(SettingsMessage::DownloadProgress {
-                                current_file: filename.clone(),
-                                file_index,
-                                file_count,
-                                downloaded,
-                                total,
-                            })
-                            .await;
-                        last_update = std::time::Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    let done = matches!(msg, SettingsMessage::DownloadComplete(_));
+                    let _ = output.send(msg).await;
+                    if done {
+                        break;
                     }
                 }
-                drop(file);
-                if total > 0 && downloaded != total {
-                    let _ = std::fs::remove_file(&part);
-                    return Err(format!(
-                        "{filename}: incomplete download ({downloaded} of {total} bytes)"
-                    ));
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
-            Ok(())
         }
-        .await;
-
-        let _ = output.send(SettingsMessage::DownloadComplete(result)).await;
         futures::future::pending::<()>().await;
     })
 }
