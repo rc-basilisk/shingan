@@ -503,7 +503,7 @@ impl DuplicateFinderState {
                         }
                     }
                     results.message = Some(format!(
-                        "{strategy}: selected {} extra copies in {groups} groups. Review, then press Remove.",
+                        "{strategy}: selected {} extra copies in {groups} groups. Review the red ones, then use the button at the bottom.",
                         results.selected_for_deletion.len()
                     ));
                 }
@@ -975,10 +975,15 @@ impl DuplicateFinderState {
             content = content.push(Rule::horizontal(1));
             content = content.push(text("Recent scans").size(16));
             for s in self.recent_sessions.iter().take(8) {
-                let mut open = button(text("Open").size(12)).padding([4, 12]);
-                if s.groups > 0 && !active {
-                    open = open.on_press(FinderMessage::OpenSession(s.id));
-                }
+                let open: Element<'_, FinderMessage> = if s.groups == 0 {
+                    text("no duplicates").size(12).style(text::secondary).into()
+                } else {
+                    let mut b = button(text("Open").size(12)).padding([4, 12]);
+                    if !active {
+                        b = b.on_press(FinderMessage::OpenSession(s.id));
+                    }
+                    b.into()
+                };
                 let mut forget = button(text("Forget").size(12))
                     .padding([4, 10])
                     .style(button::secondary);

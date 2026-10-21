@@ -19,6 +19,8 @@ pub struct AutoSorterState {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Hints from the app: whether the CLIP model / cloud are available.
     pub clip_installed: bool,
+    /// Why the installed model can't be used (e.g. ONNX Runtime missing).
+    pub clip_problem: Option<String>,
     pub cloud_enabled: bool,
 }
 
@@ -80,6 +82,7 @@ impl Default for AutoSorterState {
             run_generation: 0,
             cancel: None,
             clip_installed: false,
+            clip_problem: None,
             cloud_enabled: false,
         }
     }
@@ -287,7 +290,16 @@ impl AutoSorterState {
             .on_toggle_maybe((!running).then_some(SorterMessage::ToggleML)),
         ]
         .spacing(8);
-        if self.use_ml {
+        if self.use_ml && self.clip_installed && self.clip_problem.is_some() {
+            opts = opts.push(
+                text(format!(
+                    "The local model is installed but can't run: {}",
+                    self.clip_problem.as_deref().unwrap_or_default()
+                ))
+                .size(12)
+                .style(text::danger),
+            );
+        } else if self.use_ml {
             let hint = match (self.clip_installed, self.cloud_enabled) {
                 (true, true) => "Using the local model, plus the cloud provider for uncertain images.",
                 (true, false) => "Using the local model.",
@@ -395,6 +407,11 @@ impl AutoSorterState {
             let mut list = column![].spacing(2);
             for (from, to) in s.moves.iter().take(300) {
                 let rel = to.strip_prefix(&dest).unwrap_or(to);
+                let from = self
+                    .source_paths
+                    .iter()
+                    .find_map(|src| from.strip_prefix(src).ok())
+                    .unwrap_or(from);
                 list = list.push(
                     text(format!("{}  →  {}", from.display(), rel.display()))
                         .size(12)

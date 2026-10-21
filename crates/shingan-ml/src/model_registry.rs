@@ -34,7 +34,7 @@ pub struct ModelDef {
 pub const DEFAULT_MODELS: &[ModelDef] = &[ModelDef {
     id: "clip-vit-b32",
     name: "CLIP ViT-B/32",
-    description: "Image categorization via CLIP embeddings (Tier 2 classifier)",
+    description: "Recognizes photos, screenshots, art, memes, documents and more (runs offline)",
     files: &[ModelFileDef {
         filename: "clip_image.onnx",
         // CLIP ViT-B/32 visual encoder exported to ONNX (Xenova's HuggingFace export).

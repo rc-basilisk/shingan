@@ -70,6 +70,16 @@ impl App {
             finder: DuplicateFinderState::default(),
             sorter: AutoSorterState::default(),
         };
+        // Folders given on the command line (e.g. `shingan-gui ~/Pictures`) are
+        // pre-added to both tabs.
+        for arg in std::env::args_os().skip(1) {
+            let p = PathBuf::from(arg);
+            if p.is_dir() {
+                let s = p.to_string_lossy().into_owned();
+                app.finder.paths.push(s.clone());
+                app.sorter.source_paths.push(s);
+            }
+        }
         app.apply_settings();
         app.refresh_sessions();
         (app, Task::none())
@@ -96,6 +106,14 @@ impl App {
             RemoveMode::Trash
         };
         self.sorter.clip_installed = self.settings_tab.clip_installed();
+        self.sorter.clip_problem = if self.sorter.clip_installed {
+            let dir = shingan_ml::model_registry::resolve_models_dir(
+                self.settings.ml_model_path.as_deref().unwrap_or(""),
+            );
+            shingan_ml::onnx::ensure_runtime(&dir).err()
+        } else {
+            None
+        };
         self.sorter.cloud_enabled = self.settings.cloud_enabled;
     }
 
@@ -309,7 +327,7 @@ impl App {
         }
 
         let mut header = row![
-            text("shingan 心眼").size(24),
+            text("shingan").size(24),
             text("find duplicates · sort files")
                 .size(14)
                 .style(text::secondary),
@@ -738,7 +756,10 @@ fn sort_subscription(job: SortJob) -> impl futures::Stream<Item = SorterMessage>
                 }),
                 Some(&|msg| {
                     // Per-file dry-run lines are shown from `moves` instead.
-                    if !msg.starts_with("  ") && !msg.starts_with("Sorting ") {
+                    if !msg.starts_with("  ")
+                        && !msg.starts_with("Sorting ")
+                        && !msg.starts_with("Found ")
+                    {
                         collected.lock().unwrap().push(msg.to_string());
                     }
                 }),
