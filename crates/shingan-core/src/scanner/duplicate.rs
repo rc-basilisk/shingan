@@ -10,11 +10,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Duplicate groups keyed by category, plus newly computed `(path, signature)` pairs to persist.
-pub type ScanOutcome = (
-    HashMap<FileCategory, Vec<DuplicateGroup>>,
-    Vec<(String, String)>,
-);
+/// Files smaller than this are ignored by default (1 KiB).
+pub const DEFAULT_MIN_SIZE: u64 = 1024;
+
+/// A freshly computed signature, with the file metadata needed to key a cache entry.
+#[derive(Debug, Clone)]
+pub struct NewSignature {
+    pub path: String,
+    pub size: u64,
+    /// Modification time in whole seconds since the Unix epoch.
+    pub modified_secs: i64,
+    pub category: FileCategory,
+    pub signature: String,
+}
+
+/// Duplicate groups keyed by category, plus newly computed signatures to persist.
+pub type ScanOutcome = (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<NewSignature>);
+
+/// A persistent store of previously computed signatures (e.g. the SQLite
+/// `signature_cache` table). Implementations must only return a signature
+/// when the file's size and modification time still match.
+pub trait SignatureCache: Send + Sync {
+    /// Look up cached signatures; returns `path -> signature` for hits.
+    fn lookup(&self, category: FileCategory, files: &[&FileInfo]) -> HashMap<String, String>;
+}
+
+/// Lets a shared `Arc<impl SignatureCache>` (e.g. `Arc<Database>`) be used directly.
+impl<T: SignatureCache + ?Sized> SignatureCache for Arc<T> {
+    fn lookup(&self, category: FileCategory, files: &[&FileInfo]) -> HashMap<String, String> {
+        self.as_ref().lookup(category, files)
+    }
+}
+
+/// Modification time of a file in whole seconds since the Unix epoch.
+pub fn modified_secs(info: &FileInfo) -> i64 {
+    info.modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Progress messages sent from the scanner to the UI.
 #[derive(Debug, Clone)]
@@ -95,9 +129,10 @@ pub struct DuplicateScanner {
     control: Arc<ScanControl>,
     similarity_threshold: f64,
     progress_tx: Sender<ScanProgress>,
-    /// Pre-cached signatures from a previous scan (keyed by file path string).
-    /// Files present here skip signature computation entirely.
-    cached_signatures: HashMap<String, String>,
+    /// Persistent signature store consulted before computing signatures.
+    cache: Option<Box<dyn SignatureCache>>,
+    /// Worker thread count (0 = one per CPU core).
+    threads: usize,
 }
 
 impl DuplicateScanner {
@@ -110,17 +145,30 @@ impl DuplicateScanner {
     ) -> Self {
         Self {
             detectors,
-            file_scanner: FileScanner::new(categories).with_size_limits(1024, None),
+            file_scanner: FileScanner::new(categories).with_size_limits(DEFAULT_MIN_SIZE, None),
             control,
             similarity_threshold,
             progress_tx,
-            cached_signatures: HashMap::new(),
+            cache: None,
+            threads: 0,
         }
     }
 
-    /// Set pre-cached signatures to skip recomputation for unchanged files.
-    pub fn with_cached_signatures(mut self, cached: HashMap<String, String>) -> Self {
-        self.cached_signatures = cached;
+    /// Use a persistent signature cache so unchanged files are not re-analyzed.
+    pub fn with_signature_cache(mut self, cache: Box<dyn SignatureCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Ignore files smaller than `min` bytes (default 1 KiB) or larger than `max`.
+    pub fn with_size_limits(mut self, min: u64, max: Option<u64>) -> Self {
+        self.file_scanner = self.file_scanner.with_size_limits(min, max);
+        self
+    }
+
+    /// Number of worker threads for analysis (0 = one per CPU core).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
         self
     }
 
@@ -135,8 +183,24 @@ impl DuplicateScanner {
     /// The new signatures are `(path_string, signature)` pairs that the caller
     /// should persist to the signature cache for future rescans.
     pub fn scan_paths(&self, paths: &[(PathBuf, bool)]) -> ScanOutcome {
+        if self.threads > 0 {
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(self.threads)
+                .build()
+            {
+                Ok(pool) => return pool.install(|| self.scan_paths_inner(paths)),
+                Err(e) => self.send(ScanProgress::Status(format!(
+                    "Could not create a {}-thread pool ({e}); using defaults",
+                    self.threads
+                ))),
+            }
+        }
+        self.scan_paths_inner(paths)
+    }
+
+    fn scan_paths_inner(&self, paths: &[(PathBuf, bool)]) -> ScanOutcome {
         let mut all_results: HashMap<FileCategory, Vec<DuplicateGroup>> = HashMap::new();
-        let mut all_new_signatures: Vec<(String, String)> = Vec::new();
+        let mut all_new_signatures: Vec<NewSignature> = Vec::new();
 
         self.send(ScanProgress::Status(
             "Phase 1/3: Discovering files...".to_string(),
@@ -179,8 +243,9 @@ impl DuplicateScanner {
             )));
         }
 
-        // Phase 2: Analysis (per category)
-        let categories: Vec<FileCategory> = files_by_category.keys().copied().collect();
+        // Phase 2: Analysis (per category), in a stable order
+        let mut categories: Vec<FileCategory> = files_by_category.keys().copied().collect();
+        categories.sort_by_key(|c| FileCategory::all().iter().position(|x| x == c));
 
         for category in &categories {
             if self.control.is_stopped() {
@@ -220,34 +285,58 @@ impl DuplicateScanner {
     }
 
     /// Phase 2: Compute signatures and find duplicate groups for a single category.
-    /// Returns (groups, newly_computed_signatures) where newly_computed_signatures
-    /// contains (path_string, signature) pairs for the caller to persist.
+    /// Returns the groups plus newly computed signatures for the caller to persist.
     fn find_duplicates(
         &self,
         files: &[FileInfo],
         detector: &dyn Detector,
-    ) -> (Vec<DuplicateGroup>, Vec<(String, String)>) {
+    ) -> (Vec<DuplicateGroup>, Vec<NewSignature>) {
+        // Exact-only detectors: a file with a unique size cannot have a duplicate.
+        let files: Vec<&FileInfo> = if detector.exact_only() {
+            let mut by_size: HashMap<u64, usize> = HashMap::new();
+            for f in files {
+                *by_size.entry(f.size).or_default() += 1;
+            }
+            files.iter().filter(|f| by_size[&f.size] > 1).collect()
+        } else {
+            files.iter().collect()
+        };
+        if files.len() < 2 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let cached = match &self.cache {
+            Some(cache) => cache.lookup(detector.category(), &files),
+            None => HashMap::new(),
+        };
+
         // 2a: Compute signatures in parallel using rayon, using cache when available
         let control = self.control.clone();
         let file_count = files.len() as u32;
         let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let phase_start = Instant::now();
-        let cached = &self.cached_signatures;
 
-        // (path, signature_option, was_cache_hit)
-        let signatures: Vec<(PathBuf, Option<String>, bool)> = files
+        // (file, signature_option, was_cache_hit)
+        let signatures: Vec<(&FileInfo, Option<String>, bool)> = files
             .par_iter()
             .filter(|_| !control.is_stopped())
-            .map(|file| {
+            .map(|&file| {
                 if !control.wait_if_paused() {
-                    return (file.path.clone(), None, false);
+                    return (file, None, false);
                 }
 
                 let path_str = file.path.to_string_lossy();
                 let (sig, from_cache) = if let Some(cached_sig) = cached.get(path_str.as_ref()) {
                     (Some(cached_sig.clone()), true)
                 } else {
-                    (detector.compute_signature(&file.path).ok().flatten(), false)
+                    // A panicking decoder must not take the whole scan down.
+                    let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        detector.compute_signature(&file.path)
+                    }))
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                    (sig, false)
                 };
 
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -263,15 +352,18 @@ impl DuplicateScanner {
                         current: done,
                         total: file_count,
                         message: format!(
-                            "Computing signatures: {}/{} ({}%)",
-                            done, file_count, pct
+                            "Analyzing {}s: {}/{} ({}%)",
+                            detector.category().label(),
+                            done,
+                            file_count,
+                            pct
                         ),
                         elapsed_secs: elapsed,
                         eta_secs: eta,
                     });
                 }
 
-                (file.path.clone(), sig, from_cache)
+                (file, sig, from_cache)
             })
             .collect();
 
@@ -280,38 +372,41 @@ impl DuplicateScanner {
         }
 
         // Collect newly computed signatures for the caller to persist
-        let new_signatures: Vec<(String, String)> = signatures
+        let new_signatures: Vec<NewSignature> = signatures
             .iter()
-            .filter(|(_, sig, from_cache)| !from_cache && sig.is_some())
-            .map(|(path, sig, _)| {
-                (
-                    path.to_string_lossy().into_owned(),
-                    sig.as_ref().unwrap().clone(),
-                )
+            .filter(|(_, _, from_cache)| !from_cache)
+            .filter_map(|(file, sig, _)| {
+                sig.as_ref().map(|s| NewSignature {
+                    path: file.path.to_string_lossy().into_owned(),
+                    size: file.size,
+                    modified_secs: modified_secs(file),
+                    category: file.category,
+                    signature: s.clone(),
+                })
             })
             .collect();
 
         let cache_hits: usize = signatures.iter().filter(|(_, _, hit)| *hit).count();
+        let failed: usize = signatures.iter().filter(|(_, s, _)| s.is_none()).count();
 
         // Build signature map (only successful signatures)
         let file_signatures: HashMap<PathBuf, String> = signatures
             .into_iter()
-            .filter_map(|(path, sig, _)| sig.map(|s| (path, s)))
+            .filter_map(|(file, sig, _)| sig.map(|s| (file.path.clone(), s)))
             .collect();
 
+        let mut summary = format!(
+            "Phase 3/3: Comparing {} {} signatures",
+            file_signatures.len(),
+            detector.category().label()
+        );
         if cache_hits > 0 {
-            self.send(ScanProgress::Status(format!(
-                "Phase 2/3: {} signatures ({} cached, {} computed), finding duplicates...",
-                file_signatures.len(),
-                cache_hits,
-                file_signatures.len() - cache_hits,
-            )));
-        } else {
-            self.send(ScanProgress::Status(format!(
-                "Phase 2/3: Computed {} signatures, finding duplicates...",
-                file_signatures.len()
-            )));
+            summary.push_str(&format!(" ({cache_hits} from cache)"));
         }
+        if failed > 0 {
+            summary.push_str(&format!(" — {failed} unreadable files skipped"));
+        }
+        self.send(ScanProgress::Status(summary));
 
         // Find duplicate groups.
         let category = detector.category();
@@ -326,7 +421,6 @@ impl DuplicateScanner {
                     &file_signatures,
                     detector,
                     self.similarity_threshold,
-                    8, // prefix length
                     Some(&|done, total| {
                         let elapsed = phase3_start.elapsed().as_secs_f64();
                         let eta = if done > 0 && done < total {
@@ -347,6 +441,7 @@ impl DuplicateScanner {
                             eta_secs: eta,
                         });
                     }),
+                    Some(&self.control),
                 )
             }
             FileCategory::Archive => grouping::find_exact_groups(&file_signatures),

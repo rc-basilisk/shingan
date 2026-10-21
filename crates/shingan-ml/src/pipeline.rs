@@ -1,22 +1,22 @@
 //! Multi-tier image classification pipeline orchestrator.
 //!
-//! [`TieredPipeline`] is the main entry point for classifying images. It runs
-//! tiers 0 through 3 in order, returning the first result whose confidence
-//! exceeds the tier's configured threshold (see [`PipelineConfig`]).
+//! [`TieredPipeline`] is the main entry point for classifying images.
 //!
-//! The pipeline follows an escalation pattern:
+//! **With the local CLIP model installed**, every image (except tiny icons) is
+//! classified by CLIP (Tier 2). The cheap Tier 0 heuristics still contribute:
+//! their guess is used as a *prior* that boosts the matching CLIP category
+//! (and camera EXIF boosts all `photo_*` categories), so a camera photo ends up
+//! as `photo_landscape` or `photo_food` rather than a generic `photo_general`.
+//! If CLIP's probability is below
+//! [`PipelineConfig::cloud_escalation_threshold`] and a cloud categorizer is
+//! attached, the image is escalated to Tier 3.
 //!
-//! 1. **Tier 0** ([`crate::tier0`]) — metadata heuristics (free)
-//! 2. **Tier 1** ([`crate::tier1`]) — structural pixel analysis (cheap)
-//! 3. **Tier 2** ([`crate::onnx`]) — local ONNX CLIP inference (moderate)
-//! 4. **Tier 3** ([`crate::cloud`]) — remote vision API (expensive, optional)
+//! **Without CLIP**, the pipeline falls back to the original escalation:
+//! Tier 0 heuristics, Tier 1 structure analysis, then the cloud (if any), then
+//! relaxed versions of Tier 0/1.
 //!
-//! If all tiers fail or are unavailable, a relaxed fallback re-runs Tier 0 and
-//! Tier 1 with reduced confidence multipliers. As a last resort the pipeline
-//! returns [`ImageSubCategory::Other`] with low confidence.
-//!
-//! [`ClassificationResult`] captures the chosen category, confidence score, and
-//! which tier produced the answer.
+//! Results below [`PipelineConfig::min_confidence`] are reported as
+//! [`ImageSubCategory::Other`].
 
 use crate::cloud::CloudCategorizer;
 #[cfg(feature = "onnx")]
@@ -25,6 +25,7 @@ use crate::taxonomy::ImageSubCategory;
 use crate::tier0::{self, ImageSignals};
 use crate::tier1;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Result of classifying one image.
 #[derive(Debug, Clone)]
@@ -37,14 +38,18 @@ pub struct ClassificationResult {
 /// Configuration for tier thresholds and ONNX model directory.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Minimum confidence to accept Tier 0 (0..=1).
+    /// Minimum confidence to accept Tier 0 (0..=1) when CLIP is unavailable.
     pub tier0_min_confidence: f32,
-    /// Minimum confidence to accept Tier 1.
+    /// Minimum confidence to accept Tier 1 when CLIP is unavailable.
     pub tier1_min_confidence: f32,
-    /// Minimum confidence to accept Tier 2 (local CLIP).
+    /// Minimum CLIP probability to accept Tier 2 without asking the cloud.
     pub tier2_min_confidence: f32,
-    /// Escalate to cloud when below this after Tier 2.
+    /// Escalate to cloud when the best local probability is below this.
     pub cloud_escalation_threshold: f32,
+    /// Results below this confidence are filed as `other`.
+    pub min_confidence: f32,
+    /// Upper bound on cloud requests per pipeline (`None` = unlimited).
+    pub max_cloud_requests: Option<u32>,
     pub model_dir: Option<std::path::PathBuf>,
 }
 
@@ -55,48 +60,135 @@ impl Default for PipelineConfig {
             tier1_min_confidence: 0.48,
             tier2_min_confidence: 0.45,
             cloud_escalation_threshold: 0.4,
+            min_confidence: 0.0,
+            max_cloud_requests: None,
             model_dir: None,
         }
     }
 }
+
+/// How strongly a Tier 0 guess boosts the matching CLIP category.
+#[cfg(feature = "onnx")]
+const TIER0_PRIOR_WEIGHT: f32 = 3.0;
+/// Boost applied to every photo category when camera EXIF is present.
+#[cfg(feature = "onnx")]
+const EXIF_PHOTO_PRIOR: f32 = 3.0;
 
 /// Multi-tier image classifier (Tier 0-2 local; Tier 3 cloud optional).
 pub struct TieredPipeline {
     config: PipelineConfig,
     #[cfg(feature = "onnx")]
     onnx: Option<ClipOnnxClassifier>,
-    cloud: Option<Box<dyn CloudCategorizer>>,
+    onnx_error: Option<String>,
+    cloud: Option<Arc<dyn CloudCategorizer>>,
+    cloud_requests: u32,
+    cloud_errors: u32,
 }
 
 impl TieredPipeline {
     pub fn new(config: PipelineConfig) -> Self {
         #[cfg(feature = "onnx")]
-        let onnx = ClipOnnxClassifier::try_load(config.model_dir.as_deref()).unwrap_or(None);
+        let (onnx, onnx_error) = match ClipOnnxClassifier::try_load(config.model_dir.as_deref()) {
+            Ok(c) => (c, None),
+            Err(e) => (None, Some(e)),
+        };
+        #[cfg(not(feature = "onnx"))]
+        let onnx_error = None;
 
         Self {
             config,
             #[cfg(feature = "onnx")]
             onnx,
+            onnx_error,
             cloud: None,
+            cloud_requests: 0,
+            cloud_errors: 0,
         }
     }
 
     /// Attach an optional cloud categorizer for Tier 3 escalation.
-    pub fn with_cloud(mut self, cloud: Box<dyn CloudCategorizer>) -> Self {
-        self.cloud = Some(cloud);
+    pub fn with_cloud(mut self, cloud: Option<Arc<dyn CloudCategorizer>>) -> Self {
+        self.cloud = cloud;
         self
     }
 
-    /// Classify using local tiers first, then cloud if needed.
+    /// Why the local CLIP model could not be loaded, if it is installed but unusable.
+    pub fn onnx_error(&self) -> Option<&str> {
+        self.onnx_error.as_deref()
+    }
+
+    /// Whether Tier 2 (local CLIP) is active.
+    pub fn has_clip(&self) -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            self.onnx.is_some()
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            false
+        }
+    }
+
+    /// Number of cloud requests made so far (and how many failed).
+    pub fn cloud_usage(&self) -> (u32, u32) {
+        (self.cloud_requests, self.cloud_errors)
+    }
+
+    fn try_cloud(&mut self, path: &Path, confidence: f32) -> Option<ClassificationResult> {
+        let cloud = self.cloud.as_ref()?;
+        if self
+            .config
+            .max_cloud_requests
+            .is_some_and(|max| self.cloud_requests >= max)
+        {
+            return None;
+        }
+        self.cloud_requests += 1;
+        match cloud.categorize_blocking(path) {
+            Ok(category) => Some(ClassificationResult {
+                category,
+                confidence,
+                tier: 3,
+            }),
+            Err(_) => {
+                self.cloud_errors += 1;
+                None
+            }
+        }
+    }
+
+    fn apply_min_confidence(&self, mut r: ClassificationResult) -> ClassificationResult {
+        if r.confidence < self.config.min_confidence {
+            r.category = ImageSubCategory::Other;
+        }
+        r
+    }
+
+    /// Classify one image (cloud is used only if attached and needed).
     pub fn classify_local(
         &mut self,
         path: &Path,
         info: &shingan_core::file_info::FileInfo,
     ) -> ClassificationResult {
-        let signals = ImageSignals::from_core(info);
+        let r = self.classify_inner(path, info);
+        self.apply_min_confidence(r)
+    }
 
-        // Tier 0: heuristics
-        if let Some((cat, conf)) = tier0::classify(&signals) {
+    fn classify_inner(
+        &mut self,
+        path: &Path,
+        info: &shingan_core::file_info::FileInfo,
+    ) -> ClassificationResult {
+        let signals = ImageSignals::from_core(info);
+        let t0 = tier0::classify(&signals);
+
+        #[cfg(feature = "onnx")]
+        if let Some(r) = self.classify_with_clip(path, &signals, t0) {
+            return r;
+        }
+
+        // ---- No CLIP: heuristic escalation ----
+        if let Some((cat, conf)) = t0 {
             if conf >= self.config.tier0_min_confidence {
                 return ClassificationResult {
                     category: cat,
@@ -106,8 +198,8 @@ impl TieredPipeline {
             }
         }
 
-        // Tier 1: structure signals
-        if let Some((cat, conf)) = tier1::classify(path, None) {
+        let t1 = tier1::classify(path, None);
+        if let Some((cat, conf)) = t1 {
             if conf >= self.config.tier1_min_confidence {
                 return ClassificationResult {
                     category: cat,
@@ -117,57 +209,19 @@ impl TieredPipeline {
             }
         }
 
-        // Tier 2: ONNX CLIP
-        #[cfg(feature = "onnx")]
-        if let Some(ref mut session) = self.onnx {
-            if let Ok((cat, conf)) = session.classify(path) {
-                if conf >= self.config.tier2_min_confidence {
-                    return ClassificationResult {
-                        category: cat,
-                        confidence: conf,
-                        tier: 2,
-                    };
-                }
-                // Low confidence from ONNX — try cloud if available
-                if conf < self.config.cloud_escalation_threshold {
-                    if let Some(ref cloud) = self.cloud {
-                        if let Ok(cloud_cat) = cloud.categorize_blocking(path) {
-                            return ClassificationResult {
-                                category: cloud_cat,
-                                confidence: 0.8,
-                                tier: 3,
-                            };
-                        }
-                    }
-                }
-                return ClassificationResult {
-                    category: cat,
-                    confidence: conf,
-                    tier: 2,
-                };
-            }
-        }
-
-        // Cloud-only fallback when ONNX model is unavailable
-        if let Some(ref cloud) = self.cloud {
-            if let Ok(cloud_cat) = cloud.categorize_blocking(path) {
-                return ClassificationResult {
-                    category: cloud_cat,
-                    confidence: 0.75,
-                    tier: 3,
-                };
-            }
+        if let Some(r) = self.try_cloud(path, 0.75) {
+            return r;
         }
 
         // Relaxed local fallback
-        if let Some((cat, conf)) = tier0::classify(&signals) {
+        if let Some((cat, conf)) = t0 {
             return ClassificationResult {
                 category: cat,
                 confidence: conf * 0.9,
                 tier: 0,
             };
         }
-        if let Some((cat, conf)) = tier1::classify(path, None) {
+        if let Some((cat, conf)) = t1 {
             return ClassificationResult {
                 category: cat,
                 confidence: conf * 0.85,
@@ -181,6 +235,60 @@ impl TieredPipeline {
             tier: 0,
         }
     }
+
+    /// Tier 2 with Tier 0 as a prior. Returns `None` if CLIP is unavailable or failed.
+    #[cfg(feature = "onnx")]
+    fn classify_with_clip(
+        &mut self,
+        path: &Path,
+        signals: &ImageSignals,
+        t0: Option<(ImageSubCategory, f32)>,
+    ) -> Option<ClassificationResult> {
+        // CLIP is unreliable on tiny images; trust the icon heuristic there.
+        if let Some((ImageSubCategory::LogoIcon, conf)) = t0 {
+            if conf >= self.config.tier0_min_confidence {
+                return Some(ClassificationResult {
+                    category: ImageSubCategory::LogoIcon,
+                    confidence: conf,
+                    tier: 0,
+                });
+            }
+        }
+
+        let probs = self.onnx.as_mut()?.probabilities(path).ok()?;
+        let posterior = apply_priors(&probs, signals.has_exif, t0);
+        let (i, p) = crate::onnx::argmax(&posterior);
+        let result = ClassificationResult {
+            category: ImageSubCategory::ALL[i],
+            confidence: p,
+            tier: 2,
+        };
+
+        if p < self.config.tier2_min_confidence && p < self.config.cloud_escalation_threshold {
+            if let Some(r) = self.try_cloud(path, 0.8) {
+                return Some(r);
+            }
+        }
+        Some(result)
+    }
+}
+
+/// Combine CLIP probabilities with heuristic priors and renormalize.
+#[cfg(feature = "onnx")]
+fn apply_priors(probs: &[f32], has_exif: bool, t0: Option<(ImageSubCategory, f32)>) -> Vec<f32> {
+    let mut post: Vec<f32> = probs.to_vec();
+    for (i, cat) in ImageSubCategory::ALL.iter().enumerate() {
+        if has_exif && cat.label().starts_with("photo_") {
+            post[i] *= EXIF_PHOTO_PRIOR;
+        }
+        if let Some((c, conf)) = t0 {
+            if c == *cat {
+                post[i] *= 1.0 + TIER0_PRIOR_WEIGHT * conf;
+            }
+        }
+    }
+    let sum: f32 = post.iter().sum::<f32>().max(1e-12);
+    post.iter().map(|p| p / sum).collect()
 }
 
 #[cfg(test)]
@@ -289,6 +397,69 @@ mod tests {
         assert!(result.confidence < 0.5);
     }
 
+    struct FixedCloud(ImageSubCategory, std::sync::atomic::AtomicU32);
+    impl CloudCategorizer for FixedCloud {
+        fn categorize_blocking(&self, _: &Path) -> Result<ImageSubCategory, String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn cloud_budget_is_respected() {
+        let cloud = Arc::new(FixedCloud(ImageSubCategory::Meme, Default::default()));
+        let cfg = PipelineConfig {
+            max_cloud_requests: Some(2),
+            model_dir: Some(PathBuf::from("/nonexistent/models")),
+            ..PipelineConfig::default()
+        };
+        let mut pipeline =
+            TieredPipeline::new(cfg).with_cloud(Some(cloud.clone() as Arc<dyn CloudCategorizer>));
+        // No dimensions -> no local tier commits -> cloud is asked.
+        let info = make_file_info(None, false, 100_000);
+        let results: Vec<_> = (0..4)
+            .map(|_| pipeline.classify_local(Path::new("/nonexistent/x.png"), &info))
+            .collect();
+        assert_eq!(results[0].category, ImageSubCategory::Meme);
+        assert_eq!(results[0].tier, 3);
+        assert_eq!(results[3].category, ImageSubCategory::Other);
+        assert_eq!(cloud.1.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(pipeline.cloud_usage(), (2, 0));
+    }
+
+    #[test]
+    fn min_confidence_files_as_other() {
+        let cfg = PipelineConfig {
+            min_confidence: 0.95,
+            model_dir: Some(PathBuf::from("/nonexistent/models")),
+            ..PipelineConfig::default()
+        };
+        let mut pipeline = TieredPipeline::new(cfg);
+        let info = make_file_info(Some((1920, 1080)), false, 400_000);
+        let r = pipeline.classify_local(Path::new("/tmp/test.png"), &info);
+        assert_eq!(r.category, ImageSubCategory::Other);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn exif_prior_favors_photo_categories() {
+        let mut probs = vec![0.0f32; ImageSubCategory::ALL.len()];
+        let art = ImageSubCategory::ALL
+            .iter()
+            .position(|c| *c == ImageSubCategory::Artwork)
+            .unwrap();
+        let food = ImageSubCategory::ALL
+            .iter()
+            .position(|c| *c == ImageSubCategory::PhotoFood)
+            .unwrap();
+        probs[art] = 0.5;
+        probs[food] = 0.3;
+        let post = apply_priors(&probs, true, None);
+        assert!(post[food] > post[art]);
+        let post = apply_priors(&probs, false, None);
+        assert!(post[art] > post[food]);
+    }
+
     #[test]
     fn pipeline_new_does_not_panic() {
         let _pipeline = TieredPipeline::new(PipelineConfig::default());
@@ -301,7 +472,7 @@ mod tests {
             tier1_min_confidence: 0.9,
             tier2_min_confidence: 0.9,
             cloud_escalation_threshold: 0.8,
-            model_dir: None,
+            ..PipelineConfig::default()
         };
         let mut pipeline = TieredPipeline::new(cfg);
         let info = make_file_info(Some((1920, 1080)), false, 400_000);
@@ -320,7 +491,7 @@ mod tests {
             tier1_min_confidence: 0.99,
             tier2_min_confidence: 0.99,
             cloud_escalation_threshold: 0.99,
-            model_dir: None,
+            ..PipelineConfig::default()
         };
         let mut pipeline = TieredPipeline::new(cfg);
         let info = make_file_info(Some((1920, 1080)), false, 400_000);

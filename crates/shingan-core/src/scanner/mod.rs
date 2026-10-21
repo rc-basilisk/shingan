@@ -13,6 +13,8 @@ pub struct ScanResult {
     pub files: Vec<FileInfo>,
     pub skipped_permission: u32,
     pub skipped_other: u32,
+    /// Files outside the configured size limits (not an error).
+    pub skipped_size: u32,
 }
 
 /// Scans directories for files matching selected categories.
@@ -49,6 +51,7 @@ impl FileScanner {
         let mut files = Vec::new();
         let mut skipped_permission: u32 = 0;
         let mut skipped_other: u32 = 0;
+        let mut skipped_size: u32 = 0;
 
         let walker = if include_subdirs {
             walkdir::WalkDir::new(root).follow_links(false).into_iter()
@@ -93,15 +96,10 @@ impl FileScanner {
 
             match FileInfo::from_path(path, category) {
                 Ok(info) => {
-                    if info.size < self.min_size {
-                        skipped_other += 1;
+                    if info.size < self.min_size || self.max_size.is_some_and(|max| info.size > max)
+                    {
+                        skipped_size += 1;
                         continue;
-                    }
-                    if let Some(max) = self.max_size {
-                        if info.size > max {
-                            skipped_other += 1;
-                            continue;
-                        }
                     }
                     if let Some(cb) = progress {
                         cb(path, files.len() + 1);
@@ -119,6 +117,7 @@ impl FileScanner {
             files,
             skipped_permission,
             skipped_other,
+            skipped_size,
         }
     }
 
@@ -178,7 +177,8 @@ mod tests {
         let result = scanner.scan_directory(dir.path(), false, None);
         assert_eq!(result.files.len(), 1);
         assert!(result.files[0].path.ends_with("big.png"));
-        assert!(result.skipped_other >= 1);
+        assert_eq!(result.skipped_size, 1);
+        assert_eq!(result.skipped_other, 0);
     }
 
     #[test]

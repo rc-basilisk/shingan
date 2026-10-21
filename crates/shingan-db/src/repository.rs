@@ -2,6 +2,8 @@ use crate::models::*;
 use crate::schema;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
+use shingan_core::file_info::{FileCategory, FileInfo};
+use shingan_core::scanner::duplicate::{modified_secs, NewSignature, SignatureCache};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -34,6 +36,8 @@ impl Database {
                 std::fs::create_dir_all(parent).ok();
             }
             let conn = Connection::open(&db_path)?;
+            // Wait instead of failing when the CLI and GUI touch the DB at once.
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             schema::initialize(&conn)?;
             Ok(Self {
@@ -297,80 +301,55 @@ impl Database {
         Ok(result)
     }
 
-    /// Delete files from disk based on a keep strategy, returning (deleted, failed) counts.
-    pub fn delete_duplicates(
-        &self,
-        session_id: i64,
-        keep: KeepStrategy,
-        dry_run: bool,
-    ) -> Result<(u32, u32, Vec<String>), DbError> {
-        let group_data = self.get_session_files(session_id)?;
-        let mut deleted = 0u32;
-        let mut failed = 0u32;
-        let mut actions = Vec::new();
-
-        for (group, entries) in &group_data {
-            if entries.len() < 2 {
-                continue;
-            }
-
-            let keep_idx = match keep {
-                KeepStrategy::Newest => entries
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, e)| {
-                        std::fs::metadata(&e.file_path)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-                KeepStrategy::Oldest => entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| {
-                        std::fs::metadata(&e.file_path)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-                KeepStrategy::Largest => entries
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, e)| e.file_size)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-            };
-
-            for (i, entry) in entries.iter().enumerate() {
-                if i == keep_idx {
-                    continue;
-                }
-                if dry_run {
-                    actions.push(format!(
-                        "Would delete: {} ({:.2} MB) [group {} - {:.1}% similar]",
-                        entry.file_path,
-                        entry.file_size as f64 / 1_048_576.0,
-                        group.id,
-                        group.similarity_score * 100.0,
-                    ));
-                } else {
-                    match std::fs::remove_file(&entry.file_path) {
-                        Ok(_) => {
-                            deleted += 1;
-                            actions.push(format!("Deleted: {}", entry.file_path));
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            actions.push(format!("Failed: {} ({})", entry.file_path, e));
-                        }
-                    }
+    /// Remove file entries (e.g. after the files were deleted) from a session, and
+    /// drop any groups left with fewer than two files. Returns entries removed.
+    pub fn remove_file_entries(&self, session_id: i64, paths: &[&str]) -> Result<u64, DbError> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut removed = 0u64;
+            {
+                let mut stmt = tx.prepare(
+                    "DELETE FROM file_entries WHERE file_path = ?1 AND group_id IN
+                     (SELECT id FROM duplicate_groups WHERE session_id = ?2)",
+                )?;
+                for p in paths {
+                    removed += stmt.execute(params![p, session_id])? as u64;
                 }
             }
-        }
+            tx.execute(
+                "DELETE FROM duplicate_groups WHERE session_id = ?1 AND
+                 (SELECT COUNT(*) FROM file_entries WHERE group_id = duplicate_groups.id) < 2",
+                params![session_id],
+            )?;
+            tx.commit()?;
+            Ok(removed)
+        })
+    }
 
-        Ok((deleted, failed, actions))
+    /// Delete a single scan session and its groups.
+    pub fn delete_scan_session(&self, session_id: i64) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM scan_sessions WHERE id = ?1", params![session_id])?;
+            Ok(())
+        })
+    }
+
+    /// Number of duplicate groups and files in a session.
+    pub fn session_counts(&self, session_id: i64) -> Result<(u64, u64), DbError> {
+        self.with_conn(|conn| {
+            let groups: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM duplicate_groups WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            let files: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM file_entries WHERE group_id IN
+                 (SELECT id FROM duplicate_groups WHERE session_id = ?1)",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            Ok((groups as u64, files as u64))
+        })
     }
 
     // --- Signature Cache ---
@@ -426,6 +405,28 @@ impl Database {
                 }
             }
         })
+    }
+
+    /// Persist signatures returned by a scan.
+    pub fn cache_new_signatures(&self, sigs: &[NewSignature]) -> Result<(), DbError> {
+        let entries: Vec<(&str, i64, i64, &str, &str)> = sigs
+            .iter()
+            .map(|s| {
+                (
+                    s.path.as_str(),
+                    s.size as i64,
+                    s.modified_secs,
+                    s.category.label(),
+                    s.signature.as_str(),
+                )
+            })
+            .collect();
+        self.cache_signatures_batch(&entries)
+    }
+
+    /// Delete every cached signature (forces a full re-analysis on next scan).
+    pub fn clear_signature_cache(&self) -> Result<u64, DbError> {
+        self.with_conn(|conn| Ok(conn.execute("DELETE FROM signature_cache", [])? as u64))
     }
 
     // --- Classification Cache ---
@@ -498,7 +499,28 @@ impl Database {
     }
 }
 
-fn default_db_path() -> PathBuf {
+impl SignatureCache for Database {
+    fn lookup(&self, category: FileCategory, files: &[&FileInfo]) -> HashMap<String, String> {
+        let owned: Vec<(String, i64, i64)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.to_string_lossy().into_owned(),
+                    f.size as i64,
+                    modified_secs(f),
+                )
+            })
+            .collect();
+        let queries: Vec<(&str, i64, i64, &str)> = owned
+            .iter()
+            .map(|(p, s, m)| (p.as_str(), *s, *m, category.label()))
+            .collect();
+        self.get_cached_signatures(&queries).unwrap_or_default()
+    }
+}
+
+/// Default database location (`<data dir>/shingan/shingan.db`).
+pub fn default_db_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("shingan")
@@ -626,6 +648,36 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(db.get_file_entries(ids[0]).unwrap().len(), 2);
         assert_eq!(db.get_file_entries(ids[1]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_remove_file_entries_prunes_small_groups() {
+        let db = test_db();
+        let sid = db.create_scan_session("s", "image", 0.9).unwrap();
+        let mk = |p: &'static str| NewFileEntryBatch {
+            file_path: p,
+            file_size: 1,
+            modified_time: None,
+            thumbnail_path: None,
+            file_metadata: None,
+        };
+        let g1 = [mk("/a"), mk("/b")];
+        let g2 = [mk("/c"), mk("/d"), mk("/e")];
+        let groups: [(&str, f64, Option<&str>, &[NewFileEntryBatch]); 2] =
+            [("image", 1.0, None, &g1), ("image", 1.0, None, &g2)];
+        db.insert_duplicate_groups_batch(sid, &groups).unwrap();
+        assert_eq!(db.remove_file_entries(sid, &["/a", "/c"]).unwrap(), 2);
+        // Group 1 has a single file left and is dropped; group 2 keeps two.
+        assert_eq!(db.session_counts(sid).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn test_schema_version_set() {
+        let db = test_db();
+        let v: i64 = db
+            .with_conn(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(v, schema::SCHEMA_VERSION);
     }
 
     #[test]

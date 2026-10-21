@@ -20,8 +20,6 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-lru = "0.12"
-parking_lot = "0.12"
 walkdir = "2"
 rayon = "1"
 crossbeam-channel = "0.5"
@@ -35,17 +33,12 @@ image = "0.25"
 img_hash = "3"
 
 # Video processing
-ffmpeg-next = "7"
 vid_dup_finder_lib = "0.4"
 
 # Document processing
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 pdf-extract = "0.7"
-
-# Text similarity
-rapidfuzz = "0.5"
-strsim = "0.11"
 
 # Code syntax highlighting
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
@@ -65,7 +58,10 @@ iced = { version = "0.13", features = ["image", "tokio"] }
 rfd = "0.15"
 
 # ML / ONNX (local inference)
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+# Minimal features: load ONNX Runtime at runtime and require only API 18
+# (ONNX Runtime >= 1.18). The default features demand 1.24+.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-18"] }
+libloading = "0.8"
 ndarray = "0.17"
 
 # Internal crates

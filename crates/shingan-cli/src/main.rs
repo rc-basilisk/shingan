@@ -1,22 +1,36 @@
 //! CLI entry point for shingan (心眼), a multi-modal duplicate file detector.
 //!
-//! Provides the `scan`, `list`, `export`, `sort`, and `delete` subcommands.
 //! Run `shingan --help` for usage details.
 
-use anyhow::Context;
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Context};
+use clap::{Parser, Subcommand, ValueEnum};
 use shingan_core::detector::archive::ArchiveDetector;
 use shingan_core::detector::Detector;
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
 use shingan_db::models::*;
 use shingan_db::Database;
+use shingan_utils::cleanup::{self, KeepStrategy, RemoveMode};
+use shingan_utils::settings::{self, AppSettings};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "shingan", about = "Shingan — file deduplicator CLI")]
+#[command(
+    name = "shingan",
+    version,
+    about = "Find duplicate and near-duplicate files, and sort messy folders.",
+    after_help = "Examples:\n  \
+        shingan scan ~/Pictures                 find duplicate images and documents\n  \
+        shingan scan ~/Downloads -t all -T 0.9  every file type, 90% similarity\n  \
+        shingan list 3                          show the groups found by scan #3\n  \
+        shingan delete 3 --keep oldest          move extra copies to the trash\n  \
+        shingan sort ~/Downloads -d ~/Sorted    organize files into folders\n  \
+        shingan undo-sort ~/Sorted              put them back\n  \
+        shingan doctor                          check optional components"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,25 +38,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scan directories for duplicate files
+    /// Scan folders for duplicate and near-duplicate files
     Scan {
-        /// Directories to scan
+        /// Folders to scan
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// File types to scan (image, document, video, archive, code)
-        #[arg(short, long, default_values_t = vec!["image".to_string(), "document".to_string()])]
+        /// File types to compare: image, document, video, archive, code, or all
+        /// (comma-separated or repeated)
+        #[arg(short, long, value_delimiter = ',', default_values_t = vec!["image".to_string(), "document".to_string()])]
         types: Vec<String>,
 
-        /// Similarity threshold (0.80 - 1.00)
+        /// How similar files must be to count as duplicates (0.5 - 1.0)
         #[arg(short = 'T', long, default_value_t = 0.95)]
         threshold: f64,
 
-        /// Don't recurse into subdirectories
+        /// Only scan the given folders, not their subfolders
         #[arg(long)]
         no_recursive: bool,
 
-        /// Merge results into an existing scan session instead of creating a new one
+        /// Ignore files smaller than this many KiB (default: from settings, 1)
+        #[arg(long)]
+        min_size_kb: Option<u64>,
+
+        /// Worker threads (default: from settings, 0 = all cores)
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Add results to an existing scan session instead of creating a new one
         #[arg(long)]
         merge_session: Option<i64>,
 
@@ -51,75 +74,117 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// List scan sessions
+    /// List scan sessions, or show the duplicate groups of one session
     List {
-        /// Show details for a specific session
+        /// Session to show in detail
         session_id: Option<i64>,
     },
 
-    /// Export scan results to CSV or JSON
+    /// Export a session's results to CSV or JSON
     Export {
         /// Session ID to export
         session_id: i64,
 
-        /// Output file path
+        /// Output file (format is taken from the extension unless --format is given)
         #[arg(short, long, default_value = "results.csv")]
         output: PathBuf,
 
-        /// Output format (csv or json)
-        #[arg(short, long, default_value = "csv")]
-        format: String,
+        /// Output format
+        #[arg(short, long, value_enum)]
+        format: Option<ExportFormat>,
     },
 
-    /// Sort files into category directories
+    /// Remove duplicate copies found by a scan, keeping one file per group
+    Delete {
+        /// Session ID to clean up
+        session_id: i64,
+
+        /// Which copy to keep: newest, oldest, largest, shortest-path
+        #[arg(long, default_value = "oldest", value_parser = parse_keep_strategy)]
+        keep: KeepStrategy,
+
+        /// Show what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Delete permanently instead of moving to the trash
+        #[arg(long)]
+        permanent: bool,
+
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Sort files into folders by type (images/, documents/, videos/, ...)
     Sort {
-        /// Source directories to sort
+        /// Source folders to sort
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Destination directory
+        /// Destination folder
         #[arg(short, long)]
         dest: PathBuf,
 
-        /// Use local ML to sub-categorize images
+        /// Also sort images into sub-folders (photo_landscape, screenshot_desktop, ...)
         #[arg(long)]
         classify: bool,
 
-        /// Show what would be moved without actually moving
+        /// Ask the cloud provider configured in settings about uncertain images
+        /// (implies --classify)
+        #[arg(long)]
+        cloud: bool,
+
+        /// Leave files of unknown types where they are instead of moving them to others/
+        #[arg(long)]
+        skip_unknown: bool,
+
+        /// Show what would be moved without moving anything
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// Delete duplicate files from a scan session
-    Delete {
-        /// Session ID to delete duplicates from
-        session_id: i64,
-
-        /// Strategy: keep newest, oldest, or largest file in each group
-        #[arg(long, default_value = "newest", value_parser = parse_keep_strategy)]
-        keep: shingan_db::models::KeepStrategy,
-
-        /// Show what would be deleted without actually deleting
-        #[arg(long)]
-        dry_run: bool,
+    /// Undo a sort, moving files back where they came from
+    UndoSort {
+        /// The sort destination folder (uses its latest journal) or a journal file
+        target: PathBuf,
     },
+
+    /// Manage the optional local image-classification model
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+
+    /// Check which optional components are available
+    Doctor,
 }
 
-fn parse_keep_strategy(s: &str) -> Result<shingan_db::models::KeepStrategy, String> {
-    match s.to_lowercase().as_str() {
-        "newest" => Ok(shingan_db::models::KeepStrategy::Newest),
-        "oldest" => Ok(shingan_db::models::KeepStrategy::Oldest),
-        "largest" => Ok(shingan_db::models::KeepStrategy::Largest),
-        _ => Err(format!(
-            "Invalid strategy '{}'. Use: newest, oldest, largest",
-            s
-        )),
-    }
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Show whether the model is installed
+    Status,
+    /// Download the CLIP model (~340 MB)
+    Download,
+    /// Delete the downloaded model
+    Remove,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExportFormat {
+    Csv,
+    Json,
+}
+
+fn parse_keep_strategy(s: &str) -> Result<KeepStrategy, String> {
+    KeepStrategy::parse(s).ok_or_else(|| {
+        format!("invalid strategy '{s}'. Use: newest, oldest, largest, shortest-path")
+    })
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let db = Database::open(None).context("Failed to open database")?;
+    let settings = settings::load_settings();
 
     match cli.command {
         Commands::Scan {
@@ -127,225 +192,229 @@ fn main() -> anyhow::Result<()> {
             types,
             threshold,
             no_recursive,
+            min_size_kb,
+            threads,
             merge_session,
             name,
-        } => cmd_scan(
-            &db,
-            paths,
-            types,
-            threshold,
-            !no_recursive,
-            merge_session,
-            name,
-        )?,
-        Commands::List { session_id } => cmd_list(&db, session_id)?,
+        } => {
+            let db = open_db()?;
+            cmd_scan(
+                &db,
+                &settings,
+                ScanArgs {
+                    paths,
+                    types,
+                    threshold,
+                    recursive: !no_recursive,
+                    min_size_kb: min_size_kb.unwrap_or(settings.min_file_size_kb),
+                    threads: threads.unwrap_or(settings.thread_count as usize),
+                    merge_session,
+                    name,
+                },
+            )
+        }
+        Commands::List { session_id } => cmd_list(&open_db()?, session_id),
         Commands::Export {
             session_id,
             output,
             format,
-        } => cmd_export(&db, session_id, &output, &format)?,
-        Commands::Sort {
-            paths,
-            dest,
-            classify,
-            dry_run,
-        } => cmd_sort(paths, dest, classify, dry_run)?,
+        } => cmd_export(&open_db()?, session_id, &output, format),
         Commands::Delete {
             session_id,
             keep,
             dry_run,
-        } => cmd_delete(&db, session_id, keep, dry_run)?,
+            permanent,
+            yes,
+        } => {
+            let mode = if permanent || settings.delete_permanently {
+                RemoveMode::Permanent
+            } else {
+                RemoveMode::Trash
+            };
+            cmd_delete(&open_db()?, session_id, keep, dry_run, mode, yes)
+        }
+        Commands::Sort {
+            paths,
+            dest,
+            classify,
+            cloud,
+            skip_unknown,
+            dry_run,
+        } => cmd_sort(&settings, paths, dest, classify || cloud, cloud, skip_unknown, dry_run),
+        Commands::UndoSort { target } => cmd_undo_sort(&target),
+        Commands::Model { action } => cmd_model(&settings, action),
+        Commands::Doctor => cmd_doctor(&settings),
     }
-
-    Ok(())
 }
 
-fn cmd_scan(
-    db: &Database,
+fn open_db() -> anyhow::Result<Database> {
+    Database::open(None).context("Failed to open the shingan database")
+}
+
+struct ScanArgs {
     paths: Vec<PathBuf>,
     types: Vec<String>,
     threshold: f64,
     recursive: bool,
+    min_size_kb: u64,
+    threads: usize,
     merge_session: Option<i64>,
     name: Option<String>,
-) -> anyhow::Result<()> {
-    let categories: Vec<FileCategory> = types
-        .iter()
-        .filter_map(|t| FileCategory::from_label(t))
-        .collect();
+}
 
+fn parse_categories(types: &[String]) -> anyhow::Result<Vec<FileCategory>> {
+    let mut categories = Vec::new();
+    for t in types {
+        let t = t.trim().to_lowercase();
+        if t == "all" {
+            return Ok(FileCategory::all().to_vec());
+        }
+        let label = match t.as_str() {
+            "image" | "images" | "img" | "photo" | "photos" | "pictures" => "image",
+            "document" | "documents" | "doc" | "docs" | "text" => "document",
+            "video" | "videos" | "vid" | "movies" => "video",
+            "archive" | "archives" | "zip" => "archive",
+            "code" | "source" | "src" => "code",
+            other => other,
+        };
+        match FileCategory::from_label(label) {
+            Some(c) if !categories.contains(&c) => categories.push(c),
+            Some(_) => {}
+            None => bail!("unknown file type '{t}'. Use: image, document, video, archive, code, all"),
+        }
+    }
     if categories.is_empty() {
-        anyhow::bail!("No valid file types specified");
+        bail!("no file types specified");
+    }
+    Ok(categories)
+}
+
+fn build_detectors(
+    categories: &[FileCategory],
+    threshold: f64,
+    settings: &AppSettings,
+) -> HashMap<FileCategory, Box<dyn Detector>> {
+    use shingan_core::detector::{code, document, image, video};
+    let mut detectors: HashMap<FileCategory, Box<dyn Detector>> = HashMap::new();
+    for cat in categories {
+        let detector: Box<dyn Detector> = match cat {
+            FileCategory::Archive => Box::new(ArchiveDetector::new(threshold)),
+            FileCategory::Image => Box::new(image::ImageDetector::new(threshold, 12)),
+            FileCategory::Code => Box::new(code::CodeDetector::new(threshold)),
+            FileCategory::Document => Box::new(document::DocumentDetector::new(threshold)),
+            FileCategory::Video => Box::new(video::VideoDetector::with_sampling(
+                threshold,
+                settings.video_skip_secs,
+                settings.video_duration_secs,
+            )),
+        };
+        detectors.insert(*cat, detector);
+    }
+    detectors
+}
+
+fn cmd_scan(db: &Database, settings: &AppSettings, args: ScanArgs) -> anyhow::Result<()> {
+    let categories = parse_categories(&args.types)?;
+    if !(0.5..=1.0).contains(&args.threshold) {
+        bail!("threshold must be between 0.5 and 1.0 (got {})", args.threshold);
+    }
+    for p in &args.paths {
+        if !p.is_dir() {
+            bail!("{} is not a folder", p.display());
+        }
     }
 
-    let session_id = if let Some(existing_id) = merge_session {
-        // Verify the session exists
+    let session_id = if let Some(existing_id) = args.merge_session {
         db.get_scan_session(existing_id)
             .context("Merge target session not found")?;
         eprintln!("Merging into existing session {}", existing_id);
         existing_id
     } else {
-        let file_types_json =
-            serde_json::to_string(&types).context("Failed to serialize file types")?;
-        let session_name = name.unwrap_or_else(|| format!("CLI scan {} paths", paths.len()));
-        db.create_scan_session(&session_name, &file_types_json, threshold)
+        let labels: Vec<&str> = categories.iter().map(|c| c.label()).collect();
+        let file_types_json = serde_json::to_string(&labels)?;
+        let session_name = args.name.clone().unwrap_or_else(|| {
+            let names: Vec<String> = args
+                .paths
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect();
+            names.join(", ")
+        });
+        db.create_scan_session(&session_name, &file_types_json, args.threshold)
             .context("Failed to create scan session")?
     };
-
     db.update_session_status(session_id, "running").ok();
 
-    // Build detectors for each requested category
-    let mut detectors: HashMap<FileCategory, Box<dyn Detector>> = HashMap::new();
-    for cat in &categories {
-        let detector: Option<Box<dyn Detector>> = match cat {
-            FileCategory::Archive => Some(Box::new(ArchiveDetector::new(threshold))),
-            FileCategory::Image => Some(Box::new(
-                shingan_core::detector::image::ImageDetector::new(threshold, 12),
-            )),
-            FileCategory::Code => Some(Box::new(shingan_core::detector::code::CodeDetector::new(
-                threshold,
-            ))),
-            FileCategory::Document => Some(Box::new(
-                shingan_core::detector::document::DocumentDetector::new(threshold),
-            )),
-            FileCategory::Video => Some(Box::new(
-                shingan_core::detector::video::VideoDetector::new(threshold),
-            )),
-        };
-        if let Some(d) = detector {
-            detectors.insert(*cat, d);
-        }
-    }
-
+    let db_cache = Arc::new(Database::open(Some(&db.path)).context("Failed to open database")?);
     let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
     let control = Arc::new(ScanControl::new());
-
-    // Pre-load cached signatures from DB
-    let scan_paths: Vec<(PathBuf, bool)> = paths.iter().map(|p| (p.clone(), recursive)).collect();
-    let cached = load_cached_signatures_cli(db, &scan_paths, &categories);
-    let cache_count = cached.len();
-    if cache_count > 0 {
-        eprintln!(
-            "Loaded {} cached signatures from previous scans",
-            cache_count
-        );
-    }
-
     let scanner = DuplicateScanner::new(
         &categories,
-        detectors,
-        threshold,
-        control.clone(),
+        build_detectors(&categories, args.threshold, settings),
+        args.threshold,
+        control,
         progress_tx,
     )
-    .with_cached_signatures(cached);
+    .with_signature_cache(Box::new(db_cache))
+    .with_size_limits(args.min_size_kb * 1024, None)
+    .with_threads(args.threads);
 
-    // Run scanner in background thread
+    let scan_paths: Vec<(PathBuf, bool)> = args
+        .paths
+        .iter()
+        .map(|p| (p.clone(), args.recursive))
+        .collect();
     let handle = std::thread::spawn(move || scanner.scan_paths(&scan_paths));
 
-    // Print progress
+    use std::io::IsTerminal;
+    let tty = std::io::stderr().is_terminal();
+    let mut in_progress_line = false;
     for msg in &progress_rx {
         match msg {
-            ScanProgress::Status(s) => eprintln!("{}", s),
+            ScanProgress::Status(s) => {
+                if in_progress_line {
+                    eprintln!();
+                    in_progress_line = false;
+                }
+                eprintln!("{}", s);
+            }
+            ScanProgress::Progress { .. } if !tty => {}
             ScanProgress::Progress {
-                current,
-                total,
                 message,
                 elapsed_secs,
                 eta_secs,
+                ..
             } => {
-                if total > 0 {
-                    let pct = (current as f64 / total as f64 * 100.0) as u32;
-                    let elapsed = format_duration_cli(elapsed_secs);
-                    let eta = eta_secs
-                        .map(|e| format!(" ETA: {}", format_duration_cli(e)))
-                        .unwrap_or_default();
-                    eprint!("\r[{:3}%] {} | {}{}", pct, message, elapsed, eta);
-                }
+                let eta = eta_secs
+                    .map(|e| format!(", ~{} left", format_duration(e)))
+                    .unwrap_or_default();
+                eprint!(
+                    "\r\x1b[2K{} ({} elapsed{})",
+                    message,
+                    format_duration(elapsed_secs),
+                    eta
+                );
+                let _ = std::io::stderr().flush();
+                in_progress_line = true;
             }
             ScanProgress::PhaseCompleted { category, groups } => {
-                eprintln!(
-                    "\n  Found {} {} duplicate groups",
-                    groups.len(),
-                    category.label()
-                );
-
-                struct OwnedEntry {
-                    file_path: String,
-                    file_size: i64,
-                    modified_time: Option<String>,
+                if in_progress_line {
+                    eprintln!();
+                    in_progress_line = false;
                 }
-                struct OwnedGroup {
-                    entries: Vec<OwnedEntry>,
-                    similarity: f64,
-                }
-
-                let owned: Vec<OwnedGroup> = groups
-                    .iter()
-                    .map(|group| {
-                        let entries = group
-                            .files
-                            .iter()
-                            .map(|file_path| {
-                                let meta = std::fs::metadata(file_path).ok();
-                                let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-                                let modified = meta.and_then(|m| m.modified().ok()).and_then(|t| {
-                                    t.duration_since(std::time::UNIX_EPOCH)
-                                        .ok()
-                                        .map(|d| chrono_format_timestamp(d.as_secs()))
-                                });
-                                OwnedEntry {
-                                    file_path: file_path.to_string_lossy().into_owned(),
-                                    file_size: size,
-                                    modified_time: modified,
-                                }
-                            })
-                            .collect();
-                        OwnedGroup {
-                            entries,
-                            similarity: group.similarity,
-                        }
-                    })
-                    .collect();
-
-                let batch_refs: Vec<(&str, f64, Option<&str>, Vec<NewFileEntryBatch>)> = owned
-                    .iter()
-                    .map(|group| {
-                        let entries: Vec<NewFileEntryBatch> = group
-                            .entries
-                            .iter()
-                            .map(|e| NewFileEntryBatch {
-                                file_path: &e.file_path,
-                                file_size: e.file_size,
-                                modified_time: e.modified_time.as_deref(),
-                                thumbnail_path: None,
-                                file_metadata: None,
-                            })
-                            .collect();
-                        (
-                            category.label(),
-                            group.similarity,
-                            None as Option<&str>,
-                            entries,
-                        )
-                    })
-                    .collect();
-
-                let batch_slices: Vec<(&str, f64, Option<&str>, &[NewFileEntryBatch])> = batch_refs
-                    .iter()
-                    .map(|(ft, sim, hv, entries)| (*ft, *sim, hv.as_deref(), entries.as_slice()))
-                    .collect();
-
-                db.insert_duplicate_groups_batch(session_id, &batch_slices)
-                    .context("Failed to insert batch groups")?;
+                eprintln!("  Found {} {} duplicate groups", groups.len(), category.label());
+                persist_groups(db, session_id, category, &groups)?;
             }
-            ScanProgress::Completed => {
-                eprintln!("\nScan complete!");
-            }
-            ScanProgress::Error(e) => {
-                eprintln!("\nError: {}", e);
-            }
+            ScanProgress::Completed => {}
+            ScanProgress::Error(e) => eprintln!("\nError: {}", e),
         }
+    }
+    if in_progress_line {
+        eprintln!();
     }
 
     let (results, new_sigs) = handle
@@ -353,23 +422,98 @@ fn cmd_scan(
         .map_err(|_| anyhow::anyhow!("Scanner thread panicked"))?;
     db.update_session_status(session_id, "completed").ok();
 
-    // Persist newly computed signatures for future rescans
     if !new_sigs.is_empty() {
-        persist_new_signatures_cli(db, &new_sigs, &paths, recursive);
-        eprintln!("Cached {} new signatures for future scans", new_sigs.len());
+        if let Err(e) = db.cache_new_signatures(&new_sigs) {
+            eprintln!("Warning: could not cache signatures: {e}");
+        }
     }
 
     let total_groups: usize = results.values().map(|g| g.len()).sum();
-    let total_files: usize = results
+    let total_files: usize = results.values().flatten().map(|g| g.files.len()).sum();
+    let reclaimable: u64 = results
         .values()
-        .flat_map(|g| g.iter())
-        .map(|g| g.files.len())
+        .flatten()
+        .map(|g| {
+            let mut sizes: Vec<u64> = g
+                .files
+                .iter()
+                .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
+                .collect();
+            sizes.sort_unstable();
+            sizes.iter().rev().skip(1).sum::<u64>()
+        })
         .sum();
-    println!(
-        "\nSession {}: {} groups, {} duplicate files",
-        session_id, total_groups, total_files
-    );
+    if total_groups == 0 {
+        println!("\nNo duplicates found (session {}).", session_id);
+    } else {
+        println!(
+            "\nSession {}: {} groups, {} files, up to {} reclaimable.",
+            session_id,
+            total_groups,
+            total_files,
+            format_size(reclaimable)
+        );
+        println!("Next: `shingan list {0}` to review, `shingan delete {0} --dry-run` to preview cleanup.", session_id);
+    }
+    Ok(())
+}
 
+fn persist_groups(
+    db: &Database,
+    session_id: i64,
+    category: FileCategory,
+    groups: &[shingan_core::scanner::grouping::DuplicateGroup],
+) -> anyhow::Result<()> {
+    struct OwnedEntry {
+        file_path: String,
+        file_size: i64,
+        modified_time: Option<String>,
+    }
+    let owned: Vec<(f64, Vec<OwnedEntry>)> = groups
+        .iter()
+        .map(|group| {
+            let entries = group
+                .files
+                .iter()
+                .map(|file_path| {
+                    let meta = std::fs::metadata(file_path).ok();
+                    OwnedEntry {
+                        file_path: file_path.to_string_lossy().into_owned(),
+                        file_size: meta.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                        modified_time: meta
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs().to_string()),
+                    }
+                })
+                .collect();
+            (group.similarity, entries)
+        })
+        .collect();
+
+    let batches: Vec<(f64, Vec<NewFileEntryBatch>)> = owned
+        .iter()
+        .map(|(sim, entries)| {
+            let e = entries
+                .iter()
+                .map(|e| NewFileEntryBatch {
+                    file_path: &e.file_path,
+                    file_size: e.file_size,
+                    modified_time: e.modified_time.as_deref(),
+                    thumbnail_path: None,
+                    file_metadata: None,
+                })
+                .collect();
+            (*sim, e)
+        })
+        .collect();
+    let slices: Vec<(&str, f64, Option<&str>, &[NewFileEntryBatch])> = batches
+        .iter()
+        .map(|(sim, entries)| (category.label(), *sim, None, entries.as_slice()))
+        .collect();
+
+    db.insert_duplicate_groups_batch(session_id, &slices)
+        .context("Failed to save duplicate groups")?;
     Ok(())
 }
 
@@ -378,15 +522,19 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
         None => {
             let sessions = db.list_scan_sessions().context("Failed to list sessions")?;
             if sessions.is_empty() {
-                println!("No scan sessions found.");
+                println!("No scan sessions yet. Run `shingan scan <folder>` to create one.");
                 return Ok(());
             }
-            println!("{:<6} {:<12} {:<22} Name", "ID", "Status", "Created");
-            println!("{}", "-".repeat(60));
+            println!(
+                "{:<6} {:<10} {:<20} {:>7} {:>7}  Name",
+                "ID", "Status", "Created (UTC)", "Groups", "Files"
+            );
+            println!("{}", "-".repeat(78));
             for s in sessions {
+                let (groups, files) = db.session_counts(s.id).unwrap_or((0, 0));
                 println!(
-                    "{:<6} {:<12} {:<22} {}",
-                    s.id, s.status, s.created_at, s.name
+                    "{:<6} {:<10} {:<20} {:>7} {:>7}  {}",
+                    s.id, s.status, s.created_at, groups, files, s.name
                 );
             }
         }
@@ -396,41 +544,40 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
                 "Session {}: {} ({})",
                 session.id, session.name, session.status
             );
-            println!("Created: {}", session.created_at);
+            println!("Created: {} UTC", session.created_at);
             println!("Threshold: {:.0}%", session.similarity_threshold * 100.0);
             println!();
 
             let groups = db
                 .get_duplicate_groups(id)
                 .context("Failed to get groups")?;
-
-            // Similarity histogram
-            if !groups.is_empty() {
-                let mut above_95 = 0u32;
-                let mut range_80_95 = 0u32;
-                let mut range_60_80 = 0u32;
-                let mut below_60 = 0u32;
-                for g in &groups {
-                    let pct = g.similarity_score * 100.0;
-                    if pct >= 95.0 {
-                        above_95 += 1;
-                    } else if pct >= 80.0 {
-                        range_80_95 += 1;
-                    } else if pct >= 60.0 {
-                        range_60_80 += 1;
-                    } else {
-                        below_60 += 1;
-                    }
-                }
-                println!("Similarity distribution ({} groups):", groups.len());
-                println!("  95-100%: {} groups", above_95);
-                println!("  80-95%:  {} groups", range_80_95);
-                println!("  60-80%:  {} groups", range_60_80);
-                if below_60 > 0 {
-                    println!("  <60%:    {} groups", below_60);
-                }
-                println!();
+            if groups.is_empty() {
+                println!("No duplicate groups in this session.");
+                return Ok(());
             }
+
+            let mut buckets = [0u32; 4];
+            for g in &groups {
+                let pct = g.similarity_score * 100.0;
+                let i = if pct >= 99.95 {
+                    0
+                } else if pct >= 95.0 {
+                    1
+                } else if pct >= 80.0 {
+                    2
+                } else {
+                    3
+                };
+                buckets[i] += 1;
+            }
+            println!("Similarity distribution ({} groups):", groups.len());
+            println!("  identical: {} groups", buckets[0]);
+            println!("  95-100%:   {} groups", buckets[1]);
+            println!("  80-95%:    {} groups", buckets[2]);
+            if buckets[3] > 0 {
+                println!("  <80%:      {} groups", buckets[3]);
+            }
+            println!();
 
             for group in &groups {
                 println!(
@@ -443,10 +590,16 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
                     .get_file_entries(group.id)
                     .context("Failed to get files")?;
                 for f in &files {
+                    let missing = if Path::new(&f.file_path).exists() {
+                        ""
+                    } else {
+                        "  (missing)"
+                    };
                     println!(
-                        "    {} ({:.2} MB)",
+                        "    {} ({}){}",
                         f.file_path,
-                        f.file_size as f64 / 1_048_576.0
+                        format_size(f.file_size.max(0) as u64),
+                        missing
                     );
                 }
             }
@@ -456,23 +609,37 @@ fn cmd_list(db: &Database, session_id: Option<i64>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 fn cmd_export(
     db: &Database,
     session_id: i64,
-    output: &PathBuf,
-    format: &str,
+    output: &Path,
+    format: Option<ExportFormat>,
 ) -> anyhow::Result<()> {
+    db.get_scan_session(session_id)
+        .context("Session not found")?;
     let groups = db
         .get_duplicate_groups(session_id)
         .context("Failed to get groups")?;
+    let format = format.unwrap_or_else(|| {
+        match output.extension().and_then(|e| e.to_str()) {
+            Some(e) if e.eq_ignore_ascii_case("json") => ExportFormat::Json,
+            _ => ExportFormat::Csv,
+        }
+    });
 
-    match format {
-        "json" => {
+    let content = match format {
+        ExportFormat::Json => {
             let mut json_groups = Vec::new();
             for group in &groups {
-                let files = db
-                    .get_file_entries(group.id)
-                    .context("Failed to get files")?;
+                let files = db.get_file_entries(group.id)?;
                 let json_files: Vec<serde_json::Value> = files
                     .iter()
                     .map(|f| {
@@ -490,55 +657,335 @@ fn cmd_export(
                     "files": json_files,
                 }));
             }
-            let json_output = serde_json::json!({
+            serde_json::to_string_pretty(&serde_json::json!({
                 "session_id": session_id,
                 "groups": json_groups,
-            });
-            let content =
-                serde_json::to_string_pretty(&json_output).context("Failed to serialize JSON")?;
-            std::fs::write(output, &content).context("Failed to write output file")?;
+            }))?
         }
-        _ => {
+        ExportFormat::Csv => {
             let mut csv = String::from(
                 "group_id,file_type,similarity,file_path,file_size_bytes,modified_time\n",
             );
             for group in &groups {
-                let files = db
-                    .get_file_entries(group.id)
-                    .context("Failed to get files")?;
-                for f in &files {
+                for f in &db.get_file_entries(group.id)? {
                     csv.push_str(&format!(
-                        "{},{},{:.4},\"{}\",{},{}\n",
+                        "{},{},{:.4},{},{},{}\n",
                         group.id,
                         group.file_type,
                         group.similarity_score,
-                        f.file_path.replace('"', "\"\""),
+                        csv_field(&f.file_path),
                         f.file_size,
                         f.modified_time.as_deref().unwrap_or(""),
                     ));
                 }
             }
-            std::fs::write(output, &csv).context("Failed to write output file")?;
+            csv
         }
-    }
+    };
+    std::fs::write(output, content).context("Failed to write output file")?;
 
     println!(
         "Exported {} groups to {} ({})",
         groups.len(),
         output.display(),
-        format
+        match format {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
+        }
     );
     Ok(())
 }
 
-/// Simple timestamp formatter (avoids chrono dependency).
-fn chrono_format_timestamp(secs: u64) -> String {
-    // Basic ISO-ish format: just return the unix timestamp as a string
-    // In a real app, you'd use chrono or time crate
-    format!("{}", secs)
+fn confirm(prompt: &str) -> bool {
+    eprint!("{prompt} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn format_duration_cli(secs: f64) -> String {
+fn cmd_delete(
+    db: &Database,
+    session_id: i64,
+    keep: KeepStrategy,
+    dry_run: bool,
+    mode: RemoveMode,
+    yes: bool,
+) -> anyhow::Result<()> {
+    db.get_scan_session(session_id)
+        .context("Session not found")?;
+    let groups = db.get_session_files(session_id)?;
+
+    let mut to_remove: Vec<PathBuf> = Vec::new();
+    let mut bytes = 0u64;
+    for (group, entries) in &groups {
+        let files: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(&e.file_path)).collect();
+        let Some(plan) = cleanup::plan_group(&files, keep) else {
+            continue;
+        };
+        println!(
+            "Group {} ({:.1}% similar) - keeping {}",
+            group.id,
+            group.similarity_score * 100.0,
+            plan.keep.display()
+        );
+        for p in &plan.remove {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            bytes += size;
+            println!("    remove {} ({})", p.display(), format_size(size));
+        }
+        to_remove.extend(plan.remove);
+    }
+
+    if to_remove.is_empty() {
+        println!("Nothing to remove (fewer than two copies of each group still exist).");
+        return Ok(());
+    }
+
+    let what = format!("{} files ({})", to_remove.len(), format_size(bytes));
+    let action = match mode {
+        RemoveMode::Trash => format!("move {what} to the trash"),
+        RemoveMode::Permanent => format!("PERMANENTLY DELETE {what}"),
+    };
+    if dry_run {
+        println!("\nDry run: would {action}. Nothing was changed.");
+        return Ok(());
+    }
+    let mut prompt = action.clone();
+    if let Some(first) = prompt.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    if !yes && !confirm(&format!("\n{prompt}?")) {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let report = cleanup::remove_files(&to_remove, mode);
+    let removed: Vec<String> = report
+        .removed
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
+    db.remove_file_entries(session_id, &removed_refs).ok();
+
+    for (p, e) in &report.failed {
+        eprintln!("  failed: {} ({e})", p.display());
+    }
+    println!(
+        "\nDone: {} files {}, {} freed, {} failed.",
+        report.removed.len(),
+        match mode {
+            RemoveMode::Trash => "moved to the trash",
+            RemoveMode::Permanent => "deleted",
+        },
+        format_size(report.bytes_freed),
+        report.failed.len()
+    );
+    if !report.failed.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_sort(
+    settings: &AppSettings,
+    paths: Vec<PathBuf>,
+    dest: PathBuf,
+    classify: bool,
+    cloud: bool,
+    skip_unknown: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    for p in &paths {
+        if !p.is_dir() {
+            bail!("{} is not a folder", p.display());
+        }
+    }
+    let cloud_categorizer = if cloud {
+        let s = AppSettings {
+            cloud_enabled: true,
+            ..settings.clone()
+        };
+        let c = s
+            .cloud_categorizer()
+            .map_err(|e| anyhow::anyhow!("cloud classification unavailable: {e}"))?;
+        eprintln!(
+            "Using {} ({}) for uncertain images",
+            settings.cloud_provider,
+            s.effective_cloud_model()
+        );
+        c
+    } else {
+        None
+    };
+
+    let sorter = shingan_utils::auto_sorter::AutoSorter::new(paths, dest)
+        .with_ml(classify)
+        .with_pipeline_config(settings.pipeline_config())
+        .with_cloud(cloud_categorizer)
+        .with_include_unknown(!skip_unknown)
+        .with_dry_run(dry_run);
+
+    if dry_run {
+        eprintln!("Dry run — no files will be moved.");
+    }
+
+    use std::io::IsTerminal;
+    let tty = std::io::stderr().is_terminal();
+    let stats = sorter.sort_files(
+        Some(&|current, total, filepath| {
+            if !tty {
+                return;
+            }
+            let name = Path::new(filepath)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            eprint!("\r\x1b[2K[{}/{}] {}", current, total, name);
+            let _ = std::io::stderr().flush();
+        }),
+        Some(&|msg| {
+            if tty {
+                eprint!("\r\x1b[2K");
+            }
+            eprintln!("{}", msg);
+        }),
+    );
+
+    for e in &stats.errors {
+        eprintln!("  {e}");
+    }
+    if let Some(j) = &stats.journal {
+        println!(
+            "Undo with: shingan undo-sort \"{}\"",
+            j.parent().unwrap_or(j).display()
+        );
+    }
+    if stats.failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_undo_sort(target: &Path) -> anyhow::Result<()> {
+    let journal = if target.is_dir() {
+        shingan_utils::auto_sorter::latest_journal(target)
+            .with_context(|| format!("no sort journal found in {}", target.display()))?
+    } else {
+        target.to_path_buf()
+    };
+    let stats = shingan_utils::auto_sorter::undo_sort(&journal).map_err(anyhow::Error::msg)?;
+    for e in &stats.errors {
+        eprintln!("  {e}");
+    }
+    println!(
+        "Restored {} files ({} could not be restored).",
+        stats.restored, stats.failed
+    );
+    Ok(())
+}
+
+fn cmd_model(settings: &AppSettings, action: ModelAction) -> anyhow::Result<()> {
+    use shingan_ml::model_registry as reg;
+    let dir = reg::resolve_models_dir(settings.ml_model_path.as_deref().unwrap_or(""));
+    let model = &reg::DEFAULT_MODELS[0];
+    match action {
+        ModelAction::Status => {
+            let installed = reg::model_installed(model, &dir);
+            println!(
+                "{}: {} ({})",
+                model.name,
+                if installed { "installed" } else { "not installed" },
+                dir.display()
+            );
+        }
+        ModelAction::Download => {
+            println!("Downloading {} ({}) to {}", model.name, model.size_label, dir.display());
+            reg::download_model_blocking(model, &dir, &|name, done, total| {
+                if total > 0 {
+                    eprint!(
+                        "\r\x1b[2K{name}: {} / {} ({:.0}%)",
+                        format_size(done),
+                        format_size(total),
+                        done as f64 / total as f64 * 100.0
+                    );
+                } else {
+                    eprint!("\r\x1b[2K{name}: {}", format_size(done));
+                }
+                let _ = std::io::stderr().flush();
+            })
+            .map_err(anyhow::Error::msg)?;
+            eprintln!();
+            println!("Done. Use `shingan sort --classify` to sort images into sub-folders.");
+        }
+        ModelAction::Remove => {
+            reg::remove_model(model, &dir).map_err(anyhow::Error::msg)?;
+            println!("Removed {}.", model.name);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_doctor(settings: &AppSettings) -> anyhow::Result<()> {
+    use shingan_ml::model_registry as reg;
+    let ok = |b: bool| if b { "ok     " } else { "missing" };
+    let on_path = |cmd: &str| {
+        std::process::Command::new(cmd)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    };
+
+    println!("shingan {}", env!("CARGO_PKG_VERSION"));
+    println!("  database:  {}", shingan_db::default_db_path().display());
+    println!("  settings:  {}", settings::settings_path().display());
+    println!();
+    let dir = reg::resolve_models_dir(settings.ml_model_path.as_deref().unwrap_or(""));
+    let model = &reg::DEFAULT_MODELS[0];
+    let installed = reg::model_installed(model, &dir);
+    println!(
+        "  [{}] CLIP model       {} (optional; `shingan model download`)",
+        ok(installed),
+        dir.display()
+    );
+    match shingan_ml::onnx::ensure_runtime(&dir) {
+        Ok(loc) => println!("  [ok     ] ONNX Runtime     {loc}"),
+        Err(e) => println!("  [missing] ONNX Runtime     {e}"),
+    }
+    if installed {
+        match shingan_ml::onnx::ClipOnnxClassifier::try_load(Some(&dir)) {
+            Ok(Some(_)) => println!("  [ok     ] CLIP loads       image sub-categories available"),
+            Ok(None) => {}
+            Err(e) => println!("  [error  ] CLIP loads       {e}"),
+        }
+    }
+    println!(
+        "  [{}] ffmpeg           video thumbnails in the GUI preview",
+        ok(on_path("ffmpeg"))
+    );
+    println!(
+        "  [{}] pdftoppm         PDF page previews in the GUI (poppler-utils)",
+        ok(on_path("pdftoppm"))
+    );
+    if settings.cloud_enabled {
+        match settings.cloud_categorizer() {
+            Ok(_) => println!(
+                "  [ok     ] cloud            {} / {}",
+                settings.cloud_provider,
+                settings.effective_cloud_model()
+            ),
+            Err(e) => println!("  [error  ] cloud            {e}"),
+        }
+    } else {
+        println!("  [off    ] cloud            disabled in settings");
+    }
+    Ok(())
+}
+
+fn format_duration(secs: f64) -> String {
     let total = secs as u64;
     let h = total / 3600;
     let m = (total % 3600) / 60;
@@ -552,222 +999,54 @@ fn format_duration_cli(secs: f64) -> String {
     }
 }
 
-fn load_cached_signatures_cli(
-    db: &Database,
-    scan_paths: &[(PathBuf, bool)],
-    categories: &[FileCategory],
-) -> HashMap<String, String> {
-    use shingan_core::file_info::ExtensionMap;
-    use std::collections::HashSet;
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
 
-    let ext_map = ExtensionMap::new();
-    let cat_set: HashSet<FileCategory> = categories.iter().copied().collect();
-    let mut queries: Vec<(String, i64, i64, String)> = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for (path, recursive) in scan_paths {
-        let walker = if *recursive {
-            walkdir::WalkDir::new(path).follow_links(false).into_iter()
-        } else {
-            walkdir::WalkDir::new(path)
-                .max_depth(1)
-                .follow_links(false)
-                .into_iter()
-        };
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let fpath = entry.path();
-            let ext = match fpath.extension().and_then(|e| e.to_str()) {
-                Some(e) => e.to_lowercase(),
-                None => continue,
-            };
-            let cat = match ext_map.get(&ext) {
-                Some(c) if cat_set.contains(&c) => c,
-                _ => continue,
-            };
-            if let Ok(meta) = std::fs::metadata(fpath) {
-                let size = meta.len() as i64;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                queries.push((
-                    fpath.to_string_lossy().into_owned(),
-                    size,
-                    mtime,
-                    cat.label().to_string(),
-                ));
-            }
+    #[test]
+    fn categories_accept_commas_plurals_and_all() {
+        let c = parse_categories(&["images".into(), "document".into()]).unwrap();
+        assert_eq!(c, vec![FileCategory::Image, FileCategory::Document]);
+        assert_eq!(parse_categories(&["all".into()]).unwrap().len(), 5);
+        assert!(parse_categories(&["spreadsheets".into()]).is_err());
+        assert_eq!(parse_categories(&["docs".into()]).unwrap(), vec![FileCategory::Document]);
+    }
+
+    #[test]
+    fn cli_parses_comma_separated_types() {
+        let cli = Cli::try_parse_from(["shingan", "scan", ".", "-t", "image,video"]).unwrap();
+        match cli.command {
+            Commands::Scan { types, .. } => assert_eq!(types, vec!["image", "video"]),
+            _ => panic!(),
         }
     }
 
-    if queries.is_empty() {
-        return HashMap::new();
+    #[test]
+    fn csv_quoting() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
-    let query_refs: Vec<(&str, i64, i64, &str)> = queries
-        .iter()
-        .map(|(p, s, m, c)| (p.as_str(), *s, *m, c.as_str()))
-        .collect();
-
-    db.get_cached_signatures(&query_refs).unwrap_or_default()
-}
-
-fn cmd_sort(
-    paths: Vec<PathBuf>,
-    dest: PathBuf,
-    classify: bool,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    let sorter = shingan_utils::auto_sorter::AutoSorter::new(paths, dest)
-        .with_ml(classify)
-        .with_dry_run(dry_run);
-
-    if dry_run {
-        eprintln!("Dry run mode — no files will be moved.");
-    }
-
-    let stats = sorter.sort_files(
-        Some(&|current, total, filepath| {
-            let pct = if total > 0 {
-                (current as f64 / total as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            eprint!("\r[{:3}%] {}/{}: {}", pct, current, total, filepath);
-        }),
-        Some(&|msg| {
-            eprintln!("{}", msg);
-        }),
-    );
-
-    eprintln!();
-    if dry_run {
-        println!(
-            "Dry run: {} would be moved, {} skipped (of {} total)",
-            stats.moved, stats.skipped, stats.total
-        );
-    } else {
-        println!(
-            "Sort complete: {} moved, {} failed, {} skipped (of {} total)",
-            stats.moved, stats.failed, stats.skipped, stats.total
-        );
-    }
-
-    Ok(())
-}
-
-fn cmd_delete(
-    db: &Database,
-    session_id: i64,
-    keep: shingan_db::models::KeepStrategy,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    // Verify session exists
-    let _session = db
-        .get_scan_session(session_id)
-        .context("Session not found")?;
-    let strategy_name = match keep {
-        shingan_db::models::KeepStrategy::Newest => "newest",
-        shingan_db::models::KeepStrategy::Oldest => "oldest",
-        shingan_db::models::KeepStrategy::Largest => "largest",
-    };
-
-    if dry_run {
-        eprintln!(
-            "Dry run: would delete duplicates from session {} (keep {})",
-            session_id, strategy_name
-        );
-    } else {
-        eprintln!(
-            "Deleting duplicates from session {} (keep {})",
-            session_id, strategy_name
-        );
-    }
-
-    let (deleted, failed, actions) = db
-        .delete_duplicates(session_id, keep, dry_run)
-        .context("Failed to process deletions")?;
-
-    for action in &actions {
-        println!("  {}", action);
-    }
-
-    if dry_run {
-        println!(
-            "\nDry run complete: {} files would be deleted",
-            actions.len()
-        );
-    } else {
-        println!(
-            "\nDeletion complete: {} deleted, {} failed",
-            deleted, failed
-        );
-    }
-
-    Ok(())
-}
-
-fn persist_new_signatures_cli(
-    db: &Database,
-    new_sigs: &[(String, String)],
-    paths: &[PathBuf],
-    recursive: bool,
-) {
-    let ext_map = shingan_core::file_info::ExtensionMap::new();
-    let mut file_meta: HashMap<String, (i64, i64, String)> = HashMap::new();
-
-    for path in paths {
-        let walker = if recursive {
-            walkdir::WalkDir::new(path).follow_links(false).into_iter()
-        } else {
-            walkdir::WalkDir::new(path)
-                .max_depth(1)
-                .follow_links(false)
-                .into_iter()
-        };
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let fpath = entry.path();
-            if let Ok(meta) = std::fs::metadata(fpath) {
-                let ext = fpath
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let cat = match ext_map.get(&ext) {
-                    Some(c) => c.label().to_string(),
-                    None => continue,
-                };
-                let size = meta.len() as i64;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                file_meta.insert(fpath.to_string_lossy().into_owned(), (size, mtime, cat));
-            }
-        }
-    }
-
-    let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
-        .iter()
-        .filter_map(|(path, sig)| {
-            file_meta.get(path).map(|(size, mtime, cat)| {
-                (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str())
-            })
-        })
-        .collect();
-
-    if !entries.is_empty() {
-        if let Err(e) = db.cache_signatures_batch(&entries) {
-            eprintln!("Failed to cache signatures: {e}");
-        }
+    #[test]
+    fn sizes() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MB");
     }
 }

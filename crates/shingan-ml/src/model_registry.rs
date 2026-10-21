@@ -47,7 +47,7 @@ pub const DEFAULT_MODELS: &[ModelDef] = &[ModelDef {
 
 /// Resolve the effective models directory from an optional custom path.
 pub fn resolve_models_dir(custom_path: &str) -> PathBuf {
-    if custom_path.is_empty() {
+    if custom_path.trim().is_empty() {
         crate::model_paths::default_models_dir()
     } else {
         PathBuf::from(custom_path)
@@ -80,6 +80,78 @@ pub fn remove_model(model: &ModelDef, models_dir: &Path) -> Result<(), String> {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Failed to remove {}: {}", file.filename, e))?;
         }
+    }
+    Ok(())
+}
+
+/// Temporary name used while a file is downloading. Only renamed to the final
+/// name once complete, so an interrupted download never looks "installed".
+pub fn partial_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".part");
+    final_path.with_file_name(name)
+}
+
+/// Download every file of `model` into `models_dir` (blocking).
+///
+/// `progress` receives `(file_name, downloaded_bytes, total_bytes)`; total is 0
+/// when the server doesn't report a length.
+#[cfg(feature = "cloud")]
+pub fn download_model_blocking(
+    model: &ModelDef,
+    models_dir: &Path,
+    progress: &dyn Fn(&str, u64, u64),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    std::fs::create_dir_all(models_dir).map_err(|e| e.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(None)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    for file in model.files {
+        if file.url.is_empty() {
+            return Err(format!("no download URL configured for {}", file.filename));
+        }
+        let target = models_dir.join(file.filename);
+        let part = partial_path(&target);
+        let mut resp = client
+            .get(file.url)
+            .send()
+            .map_err(|e| format!("{}: {e}", file.filename))?;
+        if !resp.status().is_success() {
+            return Err(format!("{}: HTTP {}", file.filename, resp.status()));
+        }
+        let total = resp.content_length().unwrap_or(0);
+        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done = 0u64;
+        loop {
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| format!("{}: {e}", file.filename))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            done += n as u64;
+            progress(file.filename, done, total);
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        drop(out);
+        if total > 0 && done != total {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "{}: incomplete download ({done} of {total} bytes)",
+                file.filename
+            ));
+        }
+        std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -120,6 +192,12 @@ mod tests {
     fn resolve_models_dir_custom_path() {
         let dir = resolve_models_dir("/custom/path");
         assert_eq!(dir, PathBuf::from("/custom/path"));
+    }
+
+    #[test]
+    fn partial_path_appends_suffix() {
+        let p = partial_path(Path::new("/m/clip_image.onnx"));
+        assert_eq!(p, PathBuf::from("/m/clip_image.onnx.part"));
     }
 
     #[test]

@@ -15,8 +15,8 @@
 //! to Tier 2 ([`crate::onnx`]).
 
 use crate::taxonomy::ImageSubCategory;
-use img_hash::image as ih_image;
 use img_hash::{HashAlg, HasherConfig};
+use shingan_core::detector::image::open_sniffed;
 use std::path::Path;
 
 /// Low-cost image structure statistics (brightness, edge energy, hash parameters).
@@ -31,7 +31,7 @@ pub struct StructureStats {
 }
 
 fn sample_luma_and_edges(path: &Path) -> Option<StructureStats> {
-    let img = ih_image::open(path).ok()?.to_rgb8();
+    let img = open_sniffed(path)?.to_rgb8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
@@ -72,7 +72,7 @@ fn sample_luma_and_edges(path: &Path) -> Option<StructureStats> {
 
 /// Quick pHash for routing (single hash).
 pub fn perceptual_hash_b64(path: &Path, hash_size: u32) -> Option<String> {
-    let img = ih_image::open(path).ok()?;
+    let img = open_sniffed(path)?;
     let hasher = HasherConfig::new()
         .hash_size(hash_size, hash_size)
         .hash_alg(HashAlg::Blockhash)

@@ -6,32 +6,24 @@ use std::path::Path;
 /// Archive duplicate detector using SHA-256 exact matching.
 ///
 /// Archives are compared byte-for-byte via their hash — no fuzzy matching.
-pub struct ArchiveDetector {
-    threshold: f64,
-}
+/// Because only identical files can match, the scanner skips hashing any
+/// archive whose size is unique.
+pub struct ArchiveDetector;
 
 impl ArchiveDetector {
+    /// The threshold is ignored: archives always use exact matching.
     pub fn new(_threshold: f64) -> Self {
-        // Archives always use exact matching regardless of configured threshold
-        Self { threshold: 1.0 }
+        Self
     }
 }
 
 impl Detector for ArchiveDetector {
     fn compute_signature(&self, path: &Path) -> Result<Option<String>> {
-        match file_sha256(path) {
-            Ok(hash) => Ok(Some(hash)),
-            Err(_) => Ok(None),
-        }
+        Ok(file_sha256(path).ok())
     }
 
-    fn compare_files(&self, file1: &Path, file2: &Path) -> Result<f64> {
-        let sig1 = self.compute_signature(file1)?;
-        let sig2 = self.compute_signature(file2)?;
-        match (sig1, sig2) {
-            (Some(s1), Some(s2)) => Ok(self.compare_signatures(&s1, &s2)),
-            _ => Ok(0.0),
-        }
+    fn exact_only(&self) -> bool {
+        true
     }
 
     fn category(&self) -> FileCategory {
@@ -39,6 +31,6 @@ impl Detector for ArchiveDetector {
     }
 
     fn threshold(&self) -> f64 {
-        self.threshold
+        1.0
     }
 }

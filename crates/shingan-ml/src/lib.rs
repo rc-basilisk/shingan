@@ -15,12 +15,12 @@
 //! | 0 | [`tier0`] | Metadata heuristics (resolution, EXIF, aspect ratio) | ~0 ms |
 //! | 1 | [`tier1`] | Structural signals (brightness, edge energy, perceptual hash) | ~5 ms |
 //! | 2 | [`onnx`] | Local ONNX Runtime CLIP ViT-B/32 image encoder vs. precomputed text prototypes | ~50 ms |
-//! | 3 | [`cloud`] | Optional remote vision APIs (Ollama, OpenAI, Gemini) | ~500 ms |
+//! | 3 | [`cloud`] | Optional vision APIs (Ollama, OpenAI, Gemini, Anthropic) | ~1 s |
 //!
-//! The pipeline is orchestrated by [`pipeline::TieredPipeline`]. Each tier has a
-//! configurable confidence threshold (see [`pipeline::PipelineConfig`]); if a
-//! tier's best result exceeds its threshold the pipeline returns immediately,
-//! otherwise it escalates.
+//! The pipeline is orchestrated by [`pipeline::TieredPipeline`]. When the CLIP
+//! model is installed it classifies every image, using the Tier 0 heuristics
+//! as a prior; otherwise tiers escalate by confidence threshold (see
+//! [`pipeline::PipelineConfig`]).
 //!
 //! ## Modules
 //!
@@ -30,8 +30,8 @@
 //! - [`tier1`] — cheap structural analysis (luma, edges) from pixel sampling.
 //! - [`onnx`] — CLIP image embedding + cosine similarity against category
 //!   prototypes (requires the `onnx` feature).
-//! - [`cloud`] — the `CloudCategorizer` trait and concrete implementations for
-//!   Ollama, OpenAI, and Gemini vision APIs.
+//! - [`cloud`] — the `CloudCategorizer` trait and an HTTP implementation for
+//!   Ollama, OpenAI, Gemini and Anthropic vision APIs.
 //! - [`pipeline`] — `TieredPipeline`, `PipelineConfig`, and
 //!   `ClassificationResult`.
 //! - [`model_paths`] — default filesystem locations for ONNX model files and
@@ -44,9 +44,7 @@
 //! | Flag | Default | Effect |
 //! |------|---------|--------|
 //! | `onnx` | **yes** | Enables Tier 2 local CLIP inference via `ort` + `ndarray` |
-//! | `cloud-ollama` | no | Enables `OllamaCategorizer` (Ollama `/api/generate`) |
-//! | `cloud-openai` | no | Enables `OpenAiCategorizer` (stub) |
-//! | `cloud-gemini` | no | Enables `GeminiCategorizer` (stub) |
+//! | `cloud` | no | Enables `HttpVisionCategorizer` (Ollama, OpenAI, Gemini, Anthropic) |
 //!
 //! ## Quick start
 //!
@@ -77,5 +75,15 @@ pub mod tier0;
 pub mod tier1;
 
 pub use cloud::CloudCategorizer;
+
+/// Decode an image by sniffing its content rather than trusting the extension.
+pub fn open_image(path: &std::path::Path) -> Result<image::DynamicImage, String> {
+    image::ImageReader::open(path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())
+}
 pub use pipeline::{ClassificationResult, PipelineConfig, TieredPipeline};
 pub use taxonomy::ImageSubCategory;
