@@ -190,8 +190,8 @@ impl DocumentDetector {
 
         // UTF-16LE runs
         let mut run = String::new();
-        for pair in bytes.chunks_exact(2) {
-            let c = u16::from_le_bytes([pair[0], pair[1]]);
+        for pair in bytes.as_chunks::<2>().0 {
+            let c = u16::from_le_bytes(*pair);
             match char::from_u32(c as u32) {
                 Some(ch) if !ch.is_control() || ch == ' ' => run.push(ch),
                 _ => flush_run(&mut run, &mut out),

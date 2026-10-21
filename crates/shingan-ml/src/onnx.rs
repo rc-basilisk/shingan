@@ -341,8 +341,10 @@ fn parse_prototypes(bytes: &[u8]) -> Result<(Array2<f32>, usize), String> {
     }
     let embed_dim = n_floats / EXPECTED_PROTOTYPE_ROWS;
     let floats: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let mut protos = Array2::from_shape_vec((EXPECTED_PROTOTYPE_ROWS, embed_dim), floats)
         .map_err(|e| e.to_string())?;
