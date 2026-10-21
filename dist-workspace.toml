@@ -13,6 +13,8 @@ targets = [
 hosting = "github"
 merge-tasks = false
 allow-dirty = ["ci"]
+# Build every platform on pull requests too, so breakage shows up before tagging.
+pr-run-mode = "upload"
 
 # Only the GUI's windowing/graphics headers are needed to build on Linux.
 # (Video hashing calls the `ffmpeg` command-line tool at runtime; nothing links
