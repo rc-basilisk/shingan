@@ -123,7 +123,7 @@ fn default_vision_model() -> String {
     "llava".to_string()
 }
 fn default_confidence_threshold() -> f32 {
-    0.25
+    0.20
 }
 fn default_video_skip_secs() -> f64 {
     3.0

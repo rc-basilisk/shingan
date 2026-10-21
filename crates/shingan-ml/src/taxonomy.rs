@@ -14,8 +14,10 @@
 //! Each variant provides:
 //! - [`ImageSubCategory::label`] — snake_case string safe for use as folder names
 //! - [`ImageSubCategory::display_name`] — human-readable name for UI display
-//! - [`ImageSubCategory::clip_prompt`] — English text prototype for CLIP zero-shot
-//!   cosine similarity (used by [`crate::onnx::ClipOnnxClassifier`])
+//! - [`ImageSubCategory::clip_prompt`] — a one-line English description of the
+//!   category. The CLIP prototypes actually shipped in `data/clip_prototypes.bin`
+//!   are averages over several short prompts per category; they are generated
+//!   by `tools/gen_clip_prototypes.py`.
 //!
 //! The taxonomy is intentionally fixed at 24 categories to keep the CLIP prototype
 //! matrix small and the sorting hierarchy manageable. New categories should only be
