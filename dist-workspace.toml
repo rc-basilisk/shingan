@@ -4,7 +4,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.31.0"
 ci = "github"
-installers = ["shell", "powershell", "homebrew"]
+installers = ["shell", "powershell"]
 targets = [
     "aarch64-apple-darwin",
     "x86_64-unknown-linux-gnu",
@@ -14,19 +14,10 @@ hosting = "github"
 merge-tasks = false
 allow-dirty = ["ci"]
 
-[dist.github-custom-runners]
-x86_64-unknown-linux-gnu = "ubuntu-24.04"
-
+# Only the GUI's windowing/graphics headers are needed to build on Linux.
+# (Video hashing calls the `ffmpeg` command-line tool at runtime; nothing links
+# against FFmpeg, so no FFmpeg libraries are bundled.)
 [dist.dependencies.apt]
-ffmpeg = "*"
-libavcodec-dev = "*"
-libavformat-dev = "*"
-libavutil-dev = "*"
-libswscale-dev = "*"
-libswresample-dev = "*"
-libavdevice-dev = "*"
-libavfilter-dev = "*"
-libclang-dev = "*"
 pkg-config = "*"
 libxkbcommon-dev = "*"
 libxcb1-dev = "*"
@@ -37,7 +28,3 @@ libdbus-1-dev = "*"
 libgl-dev = "*"
 libegl-dev = "*"
 libwayland-dev = "*"
-
-[dist.dependencies.brew]
-ffmpeg = "*"
-pkg-config = "*"

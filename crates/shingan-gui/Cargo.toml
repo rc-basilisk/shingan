@@ -2,9 +2,11 @@
 name = "shingan-gui"
 version.workspace = true
 edition.workspace = true
-repository = "https://github.com/rc-basilisk/shingan"
-homepage = "https://github.com/rc-basilisk/shingan"
-description = "GUI for shingan - high-performance file deduplication and organization toolkit"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Find duplicate and near-duplicate files, and sort messy folders (desktop app)"
 
 [[bin]]
 name = "shingan-gui"

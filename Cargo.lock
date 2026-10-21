@@ -5256,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "image 0.23.14",
@@ -5295,7 +5295,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "insta",
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "dirs 6.0.0",
@@ -5332,7 +5332,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-ml"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "flate2",
@@ -5354,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "shingan-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",

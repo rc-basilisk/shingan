@@ -946,7 +946,7 @@ fn cmd_model(settings: &AppSettings, action: ModelAction) -> anyhow::Result<()> 
                 &|name, _i, _n, done, total| {
                     // Without a terminal, print one line per 10%.
                     if !tty {
-                        let pct = if total > 0 { done * 10 / total } else { 0 };
+                        let pct = (done * 10).checked_div(total).unwrap_or(0);
                         if pct != last_pct.get() {
                             last_pct.set(pct);
                             eprintln!("{name}: {}%", pct * 10);
