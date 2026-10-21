@@ -6,17 +6,18 @@
 //! Each detector implements content-aware similarity comparison for a specific file
 //! category:
 //!
-//! - **Image** -- multi-hash perceptual hashing (aHash + pHash + dHash) with a
-//!   10 000-entry parse cache for fast pairwise comparison
+//! - **Image** -- multi-hash perceptual hashing (aHash + pHash + dHash); all three
+//!   must agree
 //! - **Video** -- 3-D DCT fingerprinting across sampled frames (configurable skip
-//!   and duration via [`detector::video::VideoDetector::with_sampling`]) with a
-//!   2 000-entry parse cache
-//! - **Document** -- text extraction followed by Sorensen-Dice coefficient comparison
-//! - **Code** -- whitespace/comment normalization with fuzzy matching
+//!   and duration via [`detector::video::VideoDetector::with_sampling`])
+//! - **Document** -- text extraction followed by MinHash over word shingles
+//!   (Sorensen-Dice similarity)
+//! - **Code** -- comment/whitespace normalization, tokenization and MinHash
 //! - **Archive** -- byte-level SHA-256 for exact-match deduplication
 //!
-//! All detector caches use `parking_lot::Mutex` for non-poisoning, low-contention
-//! locking.
+//! Detectors expose locality-sensitive bucket keys
+//! ([`detector::Detector::candidate_keys`]) so the grouping phase compares only
+//! plausible pairs instead of every pair.
 //!
 //! ## Scanning pipeline
 //!
@@ -28,18 +29,18 @@
 //!    ([`scanner::FileScanner::with_size_limits`]), and track permission-denied /
 //!    I/O errors in [`scanner::ScanResult`].
 //! 2. **Fingerprinting** -- compute a signature for every discovered file using the
-//!    appropriate detector (parallelized with rayon). Pre-cached signatures from a
-//!    previous scan can be supplied via
-//!    [`scanner::duplicate::DuplicateScanner::with_cached_signatures`] to skip
+//!    appropriate detector (parallelized with rayon). A persistent
+//!    [`scanner::duplicate::SignatureCache`] can be attached via
+//!    [`scanner::duplicate::DuplicateScanner::with_signature_cache`] to skip
 //!    recomputation for unchanged files.
 //! 3. **Grouping** -- cluster files whose similarity exceeds the configured threshold
-//!    using LSH prefix bucketing and a union-find structure with strict cross-validation
+//!    using LSH bucketing and a union-find structure with strict cross-validation
 //!    (see [`scanner::grouping`]).
 //!
 //! [`scanner::duplicate::DuplicateScanner::scan_paths`] returns both the duplicate
-//! groups and a list of newly computed `(path, signature)` pairs that the caller
-//! should persist (e.g. to the `signature_cache` table in `shingan-db`) so that
-//! future rescans benefit from the cache.
+//! groups and the newly computed signatures, which the caller should persist
+//! (e.g. to the `signature_cache` table in `shingan-db`) so that future rescans
+//! benefit from the cache.
 //!
 //! ## Feature flags
 //!
@@ -73,7 +74,6 @@
 //! // Persist new_sigs to the database for future rescans.
 //! ```
 
-pub mod cache;
 pub mod detector;
 pub mod enrichment;
 pub mod error;

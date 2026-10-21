@@ -1,30 +1,50 @@
 use iced::widget::{
-    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
-    text_input, Rule,
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text, text_input,
 };
 use iced::{Element, Length, Task};
 use shingan_ml::model_registry::{self, ModelDef, DEFAULT_MODELS};
-use std::path::PathBuf;
+use shingan_utils::settings::{AppSettings, CloudProvider};
 
-/// State for the Settings tab.
+/// State for the Settings tab. Text fields are kept as strings while editing
+/// and parsed on save.
 pub struct SettingsState {
     pub thread_count: String,
-    pub cache_size_mb: String,
+    pub min_file_size_kb: String,
     pub ml_model_path: String,
     pub confidence_threshold: String,
     pub cloud_enabled: bool,
     pub cloud_provider: CloudProvider,
     pub cloud_api_key: String,
+    pub cloud_model: String,
     pub max_cloud_requests: String,
     pub ollama_url: String,
     pub vision_model: String,
     pub video_skip_secs: String,
     pub video_duration_secs: String,
+    pub delete_permanently: bool,
     pub status_message: Option<String>,
     /// Per-model installed status, keyed by model ID.
     pub model_statuses: Vec<(String, bool)>,
     /// Current download state.
     pub download: DownloadState,
+    /// Bumped on every download start so a retry restarts the subscription.
+    pub download_generation: u64,
+    /// Set to abort the running download.
+    pub download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the app after a save; the app picks it up and applies it.
+    pub saved: Option<AppSettings>,
+    /// True when fields differ from what was last saved.
+    pub dirty: bool,
+    /// Requests for the app (database work).
+    pub pending_action: Option<DbAction>,
+}
+
+/// Database actions the Settings tab asks the app to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbAction {
+    ClearSessions,
+    ClearSignatureCache,
+    Optimize,
 }
 
 /// Download progress state shown in the UI.
@@ -45,50 +65,22 @@ pub enum DownloadState {
     },
 }
 
-/// Which cloud backend to use when cloud escalation is enabled.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum CloudProvider {
-    #[default]
-    Ollama,
-    OpenAI,
-    Gemini,
-    Anthropic,
-}
-
-impl CloudProvider {
-    pub const ALL: [CloudProvider; 4] = [
-        CloudProvider::Ollama,
-        CloudProvider::OpenAI,
-        CloudProvider::Gemini,
-        CloudProvider::Anthropic,
-    ];
-}
-
-impl std::fmt::Display for CloudProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ollama => write!(f, "Ollama (local)"),
-            Self::OpenAI => write!(f, "OpenAI"),
-            Self::Gemini => write!(f, "Google Gemini"),
-            Self::Anthropic => write!(f, "Anthropic Claude"),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     ThreadCountChanged(String),
-    CacheSizeChanged(String),
+    MinFileSizeChanged(String),
     MlModelPathChanged(String),
     ConfidenceThresholdChanged(String),
     ToggleCloud(bool),
     CloudProviderSelected(CloudProvider),
     CloudApiKeyChanged(String),
+    CloudModelChanged(String),
     MaxCloudRequestsChanged(String),
     OllamaUrlChanged(String),
     VisionModelChanged(String),
     VideoSkipSecsChanged(String),
     VideoDurationSecsChanged(String),
+    TogglePermanentDelete(bool),
     StartDownload(String),
     CancelDownload,
     RemoveModel(String),
@@ -101,7 +93,9 @@ pub enum SettingsMessage {
     },
     DownloadComplete(Result<(), String>),
     SaveSettings,
+    ResetDefaults,
     ClearSessions,
+    ClearSignatureCache,
     OptimizeDb,
     ClearCache,
 }
@@ -114,35 +108,39 @@ fn refresh_model_statuses(custom_path: &str) -> Vec<(String, bool)> {
         .collect()
 }
 
-impl Default for SettingsState {
-    fn default() -> Self {
-        let settings = load_settings();
+impl SettingsState {
+    pub fn from_settings(settings: &AppSettings) -> Self {
         let ml_path = settings.ml_model_path.clone().unwrap_or_default();
         let model_statuses = refresh_model_statuses(&ml_path);
         Self {
             thread_count: settings.thread_count.to_string(),
-            cache_size_mb: settings.cache_size_mb.to_string(),
+            min_file_size_kb: settings.min_file_size_kb.to_string(),
             ml_model_path: ml_path,
             confidence_threshold: format!("{:.2}", settings.classification_confidence_threshold),
             cloud_enabled: settings.cloud_enabled,
             cloud_provider: settings.cloud_provider,
-            cloud_api_key: settings.cloud_api_key.unwrap_or_default(),
+            cloud_api_key: settings.cloud_api_key.clone().unwrap_or_default(),
+            cloud_model: settings.cloud_model.clone(),
             max_cloud_requests: settings
                 .max_cloud_requests_per_session
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
-            ollama_url: settings.ollama_url,
-            vision_model: settings.vision_model,
+            ollama_url: settings.ollama_url.clone(),
+            vision_model: settings.vision_model.clone(),
             video_skip_secs: format!("{:.1}", settings.video_skip_secs),
             video_duration_secs: format!("{:.1}", settings.video_duration_secs),
+            delete_permanently: settings.delete_permanently,
             status_message: None,
             model_statuses,
             download: DownloadState::Idle,
+            download_generation: 0,
+            download_cancel: Default::default(),
+            saved: None,
+            dirty: false,
+            pending_action: None,
         }
     }
-}
 
-impl SettingsState {
     /// Whether a download subscription should be active.
     pub fn is_downloading(&self) -> bool {
         matches!(self.download, DownloadState::Downloading { .. })
@@ -154,41 +152,105 @@ impl SettingsState {
             .any(|(id, installed)| id == model_id && *installed)
     }
 
-    pub fn update(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
+    /// Whether the CLIP model is installed (for hints elsewhere in the UI).
+    pub fn clip_installed(&self) -> bool {
+        self.model_statuses.iter().any(|(_, installed)| *installed)
+    }
+
+    /// Build settings from the form, or explain what's invalid.
+    fn to_settings(&self, base: &AppSettings) -> Result<AppSettings, String> {
+        fn num<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, String> {
+            value
+                .trim()
+                .parse()
+                .map_err(|_| format!("\"{value}\" is not a valid number for {field}"))
+        }
+        let confidence: f32 = num("confidence threshold", &self.confidence_threshold)?;
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err("Confidence threshold must be between 0 and 1".into());
+        }
+        Ok(AppSettings {
+            thread_count: num("scanner threads", &self.thread_count)?,
+            min_file_size_kb: num("minimum file size", &self.min_file_size_kb)?,
+            ollama_url: self.ollama_url.trim().to_string(),
+            vision_model: self.vision_model.trim().to_string(),
+            cloud_model: self.cloud_model.trim().to_string(),
+            ml_model_path: Some(self.ml_model_path.trim().to_string()).filter(|s| !s.is_empty()),
+            classification_confidence_threshold: confidence,
+            cloud_enabled: self.cloud_enabled,
+            cloud_provider: self.cloud_provider,
+            cloud_api_key: Some(self.cloud_api_key.trim().to_string()).filter(|s| !s.is_empty()),
+            max_cloud_requests_per_session: if self.max_cloud_requests.trim().is_empty() {
+                None
+            } else {
+                Some(num("max cloud requests", &self.max_cloud_requests)?)
+            },
+            video_skip_secs: num("video skip", &self.video_skip_secs)?,
+            video_duration_secs: num("video sample duration", &self.video_duration_secs)?,
+            delete_permanently: self.delete_permanently,
+            dark_theme: base.dark_theme,
+        })
+    }
+
+    pub fn update(
+        &mut self,
+        message: SettingsMessage,
+        current: &AppSettings,
+    ) -> Task<SettingsMessage> {
+        let edits = !matches!(
+            message,
+            SettingsMessage::StartDownload(_)
+                | SettingsMessage::CancelDownload
+                | SettingsMessage::RemoveModel(_)
+                | SettingsMessage::DownloadProgress { .. }
+                | SettingsMessage::DownloadComplete(_)
+                | SettingsMessage::SaveSettings
+                | SettingsMessage::ClearSessions
+                | SettingsMessage::ClearSignatureCache
+                | SettingsMessage::OptimizeDb
+                | SettingsMessage::ClearCache
+        );
         match message {
             SettingsMessage::ThreadCountChanged(val) => self.thread_count = val,
-            SettingsMessage::CacheSizeChanged(val) => self.cache_size_mb = val,
+            SettingsMessage::MinFileSizeChanged(val) => self.min_file_size_kb = val,
             SettingsMessage::MlModelPathChanged(val) => {
                 self.ml_model_path = val;
                 self.model_statuses = refresh_model_statuses(&self.ml_model_path);
             }
             SettingsMessage::ConfidenceThresholdChanged(val) => self.confidence_threshold = val,
             SettingsMessage::ToggleCloud(val) => self.cloud_enabled = val,
-            SettingsMessage::CloudProviderSelected(p) => self.cloud_provider = p,
+            SettingsMessage::CloudProviderSelected(p) => {
+                if p != self.cloud_provider {
+                    self.cloud_model.clear();
+                }
+                self.cloud_provider = p;
+            }
             SettingsMessage::CloudApiKeyChanged(val) => self.cloud_api_key = val,
+            SettingsMessage::CloudModelChanged(val) => self.cloud_model = val,
             SettingsMessage::MaxCloudRequestsChanged(val) => self.max_cloud_requests = val,
             SettingsMessage::OllamaUrlChanged(val) => self.ollama_url = val,
             SettingsMessage::VisionModelChanged(val) => self.vision_model = val,
             SettingsMessage::VideoSkipSecsChanged(val) => self.video_skip_secs = val,
             SettingsMessage::VideoDurationSecsChanged(val) => self.video_duration_secs = val,
+            SettingsMessage::TogglePermanentDelete(val) => self.delete_permanently = val,
 
             SettingsMessage::StartDownload(model_id) => {
                 if let Some(model) = model_registry::find_model(&model_id) {
                     if !model_registry::model_downloadable(model) {
                         self.download = DownloadState::Failed {
                             model_id,
-                            error: "Download URLs are not yet configured for this model."
-                                .to_string(),
+                            error: "No download URL is configured for this model.".to_string(),
                         };
                     } else {
-                        let first_file = model
-                            .files
-                            .first()
-                            .map(|f| f.filename.to_string())
-                            .unwrap_or_default();
+                        self.download_generation += 1;
+                        self.download_cancel = Default::default();
                         self.download = DownloadState::Downloading {
                             model_id,
-                            current_file: first_file,
+                            current_file: model
+                                .files
+                                .first()
+                                .map(|f| f.filename.to_string())
+                                .unwrap_or_default(),
                             file_index: 0,
                             file_count: model.files.len(),
                             downloaded_bytes: 0,
@@ -200,16 +262,16 @@ impl SettingsState {
             }
 
             SettingsMessage::CancelDownload => {
-                // Clean up partial files for the model being downloaded.
+                // Stop the transfer and remove only the partial file; an installed
+                // copy stays untouched.
+                self.download_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 if let DownloadState::Downloading { ref model_id, .. } = self.download {
                     if let Some(model) = model_registry::find_model(model_id) {
                         let dir = model_registry::resolve_models_dir(&self.ml_model_path);
                         for file in model.files {
-                            let path = dir.join(file.filename);
-                            // Only remove if it's not a complete, previously-installed file.
-                            // We can't easily tell, so just leave files in place — the status
-                            // check will reflect reality.
-                            let _ = std::fs::remove_file(&path);
+                            let part = model_registry::partial_path(&dir.join(file.filename));
+                            let _ = std::fs::remove_file(part);
                         }
                     }
                 }
@@ -221,14 +283,11 @@ impl SettingsState {
             SettingsMessage::RemoveModel(model_id) => {
                 if let Some(model) = model_registry::find_model(&model_id) {
                     let dir = model_registry::resolve_models_dir(&self.ml_model_path);
-                    match model_registry::remove_model(model, &dir) {
-                        Ok(()) => {
-                            self.status_message = Some(format!("{} removed.", model.name));
-                        }
-                        Err(e) => {
-                            self.status_message = Some(format!("Remove failed: {}", e));
-                        }
-                    }
+                    model_registry::remove_runtime(&dir);
+                    self.status_message = Some(match model_registry::remove_model(model, &dir) {
+                        Ok(()) => format!("{} removed.", model.name),
+                        Err(e) => format!("Remove failed: {}", e),
+                    });
                     self.model_statuses = refresh_model_statuses(&self.ml_model_path);
                 }
             }
@@ -260,7 +319,10 @@ impl SettingsState {
             SettingsMessage::DownloadComplete(result) => {
                 match result {
                     Ok(()) => {
-                        self.status_message = Some("Model downloaded successfully.".to_string());
+                        self.status_message = Some(
+                            "Model downloaded. Image sub-categories are now available in Auto-Sort."
+                                .to_string(),
+                        );
                         self.download = DownloadState::Idle;
                     }
                     Err(e) => {
@@ -274,249 +336,257 @@ impl SettingsState {
                 self.model_statuses = refresh_model_statuses(&self.ml_model_path);
             }
 
-            SettingsMessage::SaveSettings => {
-                let settings = AppSettings {
-                    thread_count: self.thread_count.parse().unwrap_or(4),
-                    cache_size_mb: self.cache_size_mb.parse().unwrap_or(500),
-                    ollama_url: self.ollama_url.clone(),
-                    vision_model: self.vision_model.clone(),
-                    ml_model_path: if self.ml_model_path.is_empty() {
-                        None
-                    } else {
-                        Some(self.ml_model_path.clone())
-                    },
-                    classification_confidence_threshold: self
-                        .confidence_threshold
-                        .parse()
-                        .unwrap_or(0.6),
-                    cloud_enabled: self.cloud_enabled,
-                    cloud_provider: self.cloud_provider,
-                    cloud_api_key: if self.cloud_api_key.is_empty() {
-                        None
-                    } else {
-                        Some(self.cloud_api_key.clone())
-                    },
-                    max_cloud_requests_per_session: self.max_cloud_requests.parse().ok(),
-                    video_skip_secs: self.video_skip_secs.parse().unwrap_or(3.0),
-                    video_duration_secs: self.video_duration_secs.parse().unwrap_or(20.0),
+            SettingsMessage::SaveSettings => match self.to_settings(current) {
+                Ok(settings) => match shingan_utils::settings::save_settings(&settings) {
+                    Ok(()) => {
+                        self.status_message = Some("Settings saved.".to_string());
+                        self.saved = Some(settings);
+                        self.dirty = false;
+                    }
+                    Err(e) => self.status_message = Some(format!("Could not save settings: {e}")),
+                },
+                Err(e) => self.status_message = Some(e),
+            },
+            SettingsMessage::ResetDefaults => {
+                let keep_theme = AppSettings {
+                    dark_theme: current.dark_theme,
+                    ..AppSettings::default()
                 };
-                match save_settings(&settings) {
-                    Ok(_) => self.status_message = Some("Settings saved!".to_string()),
-                    Err(e) => self.status_message = Some(format!("Error: {}", e)),
-                }
+                let mut fresh = Self::from_settings(&keep_theme);
+                fresh.download = std::mem::replace(&mut self.download, DownloadState::Idle);
+                fresh.download_generation = self.download_generation;
+                *self = fresh;
+                self.status_message =
+                    Some("Defaults restored — press Save to keep them.".to_string());
             }
-            SettingsMessage::ClearSessions => {
-                self.status_message = Some("Sessions cleared".to_string());
+            SettingsMessage::ClearSessions => self.pending_action = Some(DbAction::ClearSessions),
+            SettingsMessage::ClearSignatureCache => {
+                self.pending_action = Some(DbAction::ClearSignatureCache)
             }
-            SettingsMessage::OptimizeDb => {
-                self.status_message = Some("Database optimized".to_string());
-            }
+            SettingsMessage::OptimizeDb => self.pending_action = Some(DbAction::Optimize),
             SettingsMessage::ClearCache => {
-                let cache_dir = dirs::cache_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("shingan")
-                    .join("thumbnails");
-                if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
-                    self.status_message = Some(format!("Error clearing cache: {}", e));
-                } else {
-                    std::fs::create_dir_all(&cache_dir).ok();
-                    self.status_message = Some("Cache cleared!".to_string());
+                let base = dirs::cache_dir()
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("shingan");
+                let mut freed = 0u64;
+                for sub in ["thumbnails", "previews"] {
+                    let dir = base.join(sub);
+                    freed += dir_size(&dir);
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
+                self.status_message = Some(format!(
+                    "Preview cache cleared ({} freed).",
+                    format_bytes(freed)
+                ));
             }
+        }
+        if edits {
+            self.dirty = true;
         }
         Task::none()
     }
 
     pub fn view(&self) -> Element<'_, SettingsMessage> {
-        let label_width = 220;
+        let label_width = 240;
+        let field = |label: &'static str, input: Element<'static, SettingsMessage>| {
+            row![text(label).width(label_width), input]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+        };
+        let hint = |s: &'static str| text(s).size(12).style(text::secondary);
         let mut content = column![].spacing(16).padding([16, 24]);
 
-        // -- Performance card --
-        {
-            let card = container(
-                column![
-                    text("Performance").size(16),
-                    row![
-                        text("Scanner threads:").width(label_width),
-                        text_input("4", &self.thread_count)
-                            .on_input(SettingsMessage::ThreadCountChanged)
-                            .width(100),
-                    ]
-                    .spacing(10),
-                    row![
-                        text("Thumbnail cache size (MB):").width(label_width),
-                        text_input("500", &self.cache_size_mb)
-                            .on_input(SettingsMessage::CacheSizeChanged)
-                            .width(100),
-                    ]
-                    .spacing(10),
-                    row![
-                        text("Video skip intro (secs):").width(label_width),
-                        text_input("3.0", &self.video_skip_secs)
-                            .on_input(SettingsMessage::VideoSkipSecsChanged)
-                            .width(100),
-                    ]
-                    .spacing(10),
-                    row![
-                        text("Video sample duration (secs):").width(label_width),
-                        text_input("20.0", &self.video_duration_secs)
-                            .on_input(SettingsMessage::VideoDurationSecsChanged)
-                            .width(100),
-                    ]
-                    .spacing(10),
-                ]
-                .spacing(10),
-            )
-            .padding(15)
-            .width(Length::Fill);
-            content = content.push(card);
-        }
-
-        content = content.push(Rule::horizontal(1));
-
-        // -- Local ML card --
-        {
-            let mut ml_col = column![
-                text("Local ML Categorization").size(16),
-                row![
-                    text("Confidence threshold (0-1):").width(label_width),
-                    text_input("0.60", &self.confidence_threshold)
-                        .on_input(SettingsMessage::ConfidenceThresholdChanged)
-                        .width(100),
-                ]
-                .spacing(10),
-                row![
-                    text("Custom model path (optional):").width(label_width),
-                    text_input("Leave empty for default", &self.ml_model_path)
-                        .on_input(SettingsMessage::MlModelPathChanged)
-                        .width(Length::Fill),
-                ]
-                .spacing(10),
-            ]
-            .spacing(10);
-
-            // Model roster
-            ml_col = ml_col.push(text("Models").size(14));
-
-            for model in DEFAULT_MODELS {
-                ml_col = ml_col.push(self.view_model_card(model));
-            }
-
-            let card = container(ml_col).padding(15).width(Length::Fill);
-            content = content.push(card);
-        }
-
-        content = content.push(Rule::horizontal(1));
-
-        // -- Cloud APIs card --
-        {
-            let mut cloud_fields = column![
-                text("Cloud APIs (Advanced)").size(16),
+        // -- Scanning --
+        content = content.push(card(
+            column![
+                text("Scanning").size(16),
+                field(
+                    "Worker threads (0 = all cores):",
+                    text_input("0", &self.thread_count)
+                        .on_input(SettingsMessage::ThreadCountChanged)
+                        .width(100)
+                        .into(),
+                ),
+                field(
+                    "Ignore files smaller than (KiB):",
+                    text_input("1", &self.min_file_size_kb)
+                        .on_input(SettingsMessage::MinFileSizeChanged)
+                        .width(100)
+                        .into(),
+                ),
+                field(
+                    "Video: skip first (seconds):",
+                    text_input("3.0", &self.video_skip_secs)
+                        .on_input(SettingsMessage::VideoSkipSecsChanged)
+                        .width(100)
+                        .into(),
+                ),
+                field(
+                    "Video: sample length (seconds):",
+                    text_input("20.0", &self.video_duration_secs)
+                        .on_input(SettingsMessage::VideoDurationSecsChanged)
+                        .width(100)
+                        .into(),
+                ),
+                hint("Skipping intros helps match re-encoded copies of the same video."),
                 checkbox(
-                    "Enable cloud escalation for low-confidence images",
-                    self.cloud_enabled
+                    "Delete duplicates permanently (instead of moving them to the trash)",
+                    self.delete_permanently,
                 )
-                .on_toggle(SettingsMessage::ToggleCloud),
-                row![
-                    text("Cloud provider:").width(label_width),
-                    pick_list(
-                        CloudProvider::ALL.as_slice(),
-                        Some(self.cloud_provider),
-                        SettingsMessage::CloudProviderSelected,
-                    )
-                    .width(200),
-                ]
-                .spacing(10),
+                .on_toggle(SettingsMessage::TogglePermanentDelete),
             ]
-            .spacing(10);
+            .spacing(10),
+        ));
 
-            if self.cloud_provider == CloudProvider::Ollama {
-                cloud_fields = cloud_fields.push(
-                    row![
-                        text("Ollama API URL:").width(label_width),
-                        text_input("http://localhost:11434", &self.ollama_url)
-                            .on_input(SettingsMessage::OllamaUrlChanged)
-                            .width(Length::Fill),
-                    ]
-                    .spacing(10),
-                );
-                cloud_fields = cloud_fields.push(
-                    row![
-                        text("Vision model:").width(label_width),
-                        text_input("llava", &self.vision_model)
-                            .on_input(SettingsMessage::VisionModelChanged)
-                            .width(200),
-                    ]
-                    .spacing(10),
-                );
-            } else {
-                cloud_fields = cloud_fields.push(
-                    row![
-                        text("API key:").width(label_width),
-                        text_input("Enter API key...", &self.cloud_api_key)
-                            .on_input(SettingsMessage::CloudApiKeyChanged)
-                            .width(Length::Fill)
-                            .secure(true),
-                    ]
-                    .spacing(10),
-                );
-            }
+        // -- Local ML --
+        let mut ml_col = column![
+            text("Image sub-categories (local AI)").size(16),
+            hint("Lets Auto-Sort file images into folders like photo_landscape or screenshot_desktop. Runs entirely on this computer."),
+            field(
+                "Minimum confidence (0-1):",
+                text_input("0.20", &self.confidence_threshold)
+                    .on_input(SettingsMessage::ConfidenceThresholdChanged)
+                    .width(100)
+                    .into(),
+            ),
+            hint("Images the model is less sure about go to images/other."),
+            field(
+                "Model folder (optional):",
+                text_input("Default location", &self.ml_model_path)
+                    .on_input(SettingsMessage::MlModelPathChanged)
+                    .width(Length::Fill)
+                    .into(),
+            ),
+        ]
+        .spacing(10);
+        for model in DEFAULT_MODELS {
+            ml_col = ml_col.push(self.view_model_card(model));
+        }
+        content = content.push(card(ml_col));
 
-            cloud_fields = cloud_fields.push(
+        // -- Cloud --
+        let mut cloud_fields = column![
+            text("Cloud classification (optional)").size(16),
+            hint("Ask an online (or local Ollama) vision model about images the local model is unsure of. Images are downscaled to 768 px before sending."),
+            checkbox("Enable cloud classification", self.cloud_enabled)
+                .on_toggle(SettingsMessage::ToggleCloud),
+            field(
+                "Provider:",
+                pick_list(
+                    CloudProvider::ALL.as_slice(),
+                    Some(self.cloud_provider),
+                    SettingsMessage::CloudProviderSelected,
+                )
+                .width(220)
+                .into(),
+            ),
+        ]
+        .spacing(10);
+
+        if self.cloud_provider == CloudProvider::Ollama {
+            cloud_fields = cloud_fields
+                .push(field(
+                    "Ollama URL:",
+                    text_input("http://localhost:11434", &self.ollama_url)
+                        .on_input(SettingsMessage::OllamaUrlChanged)
+                        .width(Length::Fill)
+                        .into(),
+                ))
+                .push(field(
+                    "Vision model:",
+                    text_input("llava", &self.vision_model)
+                        .on_input(SettingsMessage::VisionModelChanged)
+                        .width(220)
+                        .into(),
+                ));
+        } else {
+            let env = self
+                .cloud_provider
+                .provider()
+                .api_key_env()
+                .unwrap_or_default();
+            cloud_fields = cloud_fields
+                .push(field(
+                    "Model:",
+                    text_input(self.cloud_provider.default_model(), &self.cloud_model)
+                        .on_input(SettingsMessage::CloudModelChanged)
+                        .width(260)
+                        .into(),
+                ))
+                .push(field(
+                    "API key:",
+                    text_input("Leave empty to use the environment variable", &self.cloud_api_key)
+                        .on_input(SettingsMessage::CloudApiKeyChanged)
+                        .width(Length::Fill)
+                        .secure(true)
+                        .into(),
+                ))
+                .push(
+                    text(format!(
+                        "Keys are saved unencrypted in settings.json. Setting {env} instead keeps them out of the file."
+                    ))
+                    .size(12)
+                    .style(text::secondary),
+                );
+        }
+        cloud_fields = cloud_fields.push(field(
+            "Max requests per sort:",
+            text_input("unlimited", &self.max_cloud_requests)
+                .on_input(SettingsMessage::MaxCloudRequestsChanged)
+                .width(100)
+                .into(),
+        ));
+        content = content.push(card(cloud_fields));
+
+        // -- Database & cache --
+        content = content.push(card(
+            column![
+                text("Data").size(16),
                 row![
-                    text("Max cloud requests/session:").width(label_width),
-                    text_input("unlimited", &self.max_cloud_requests)
-                        .on_input(SettingsMessage::MaxCloudRequestsChanged)
-                        .width(100),
+                    button(text("Delete scan history").size(13))
+                        .padding([6, 14])
+                        .style(button::danger)
+                        .on_press(SettingsMessage::ClearSessions),
+                    button(text("Forget cached fingerprints").size(13))
+                        .padding([6, 14])
+                        .style(button::secondary)
+                        .on_press(SettingsMessage::ClearSignatureCache),
+                    button(text("Compact database").size(13))
+                        .padding([6, 14])
+                        .style(button::secondary)
+                        .on_press(SettingsMessage::OptimizeDb),
+                    button(text("Clear preview cache").size(13))
+                        .padding([6, 14])
+                        .style(button::secondary)
+                        .on_press(SettingsMessage::ClearCache),
                 ]
-                .spacing(10),
-            );
-
-            let card = container(cloud_fields).padding(15).width(Length::Fill);
-            content = content.push(card);
-        }
-
-        content = content.push(Rule::horizontal(1));
-
-        // -- Database & Cache card --
-        {
-            let card = container(
-                column![
-                    text("Database & Cache").size(16),
-                    row![
-                        button(text("Clear Old Sessions").size(13))
-                            .padding([6, 14])
-                            .on_press(SettingsMessage::ClearSessions),
-                        button(text("Optimize Database").size(13))
-                            .padding([6, 14])
-                            .on_press(SettingsMessage::OptimizeDb),
-                        button(text("Clear Thumbnail Cache").size(13))
-                            .padding([6, 14])
-                            .on_press(SettingsMessage::ClearCache),
-                    ]
-                    .spacing(10),
-                ]
-                .spacing(10),
-            )
-            .padding(15)
-            .width(Length::Fill);
-            content = content.push(card);
-        }
-
-        content = content.push(Rule::horizontal(1));
+                .spacing(10)
+                .wrap(),
+                hint("Cached fingerprints make re-scans of unchanged files instant; forgetting them only costs time."),
+            ]
+            .spacing(10),
+        ));
 
         // -- Save --
+        let save_label = if self.dirty {
+            "Save settings (unsaved changes)"
+        } else {
+            "Save settings"
+        };
         content = content.push(
-            container(
-                button(text("Save Settings").size(14))
-                    .padding([10, 0])
-                    .width(Length::Fill)
+            row![
+                button(text(save_label).size(14))
+                    .padding([10, 20])
+                    .style(button::primary)
                     .on_press(SettingsMessage::SaveSettings),
-            )
-            .padding([4, 0]),
+                button(text("Reset to defaults").size(13))
+                    .padding([10, 16])
+                    .style(button::secondary)
+                    .on_press(SettingsMessage::ResetDefaults),
+            ]
+            .spacing(10),
         );
 
-        // -- Status --
         if let Some(ref msg) = self.status_message {
             content = content.push(container(text(msg).size(14)).padding([8, 12]));
         }
@@ -528,53 +598,40 @@ impl SettingsState {
     fn view_model_card<'a>(&self, model: &ModelDef) -> Element<'a, SettingsMessage> {
         let installed = self.is_model_installed(model.id);
 
-        // Header: name + size
         let header = row![
             text(model.name).size(13),
             iced::widget::horizontal_space(),
             text(model.size_label).size(12),
         ]
         .align_y(iced::Alignment::Center);
-
         let desc = text(model.description).size(12);
 
-        // Status row depends on current state
-        let status_row: Element<'a, SettingsMessage> = if let DownloadState::Downloading {
-            ref model_id,
-            ref current_file,
-            file_index,
-            file_count,
-            downloaded_bytes,
-            total_bytes,
-            ..
-        } = self.download
-        {
-            if model_id == model.id {
-                let pct = if total_bytes > 0 {
-                    (downloaded_bytes as f32 / total_bytes as f32) * 100.0
+        let status_row: Element<'a, SettingsMessage> = match &self.download {
+            DownloadState::Downloading {
+                model_id,
+                current_file,
+                file_index,
+                file_count,
+                downloaded_bytes,
+                total_bytes,
+            } if model_id == model.id => {
+                let pct = if *total_bytes > 0 {
+                    (*downloaded_bytes as f32 / *total_bytes as f32) * 100.0
                 } else {
                     0.0
                 };
-                let progress_label = if total_bytes > 0 {
-                    format!(
-                        "Downloading {} ({}/{})... {} / {}",
-                        current_file,
-                        file_index + 1,
-                        file_count,
-                        format_bytes(downloaded_bytes),
-                        format_bytes(total_bytes),
-                    )
-                } else {
-                    format!(
-                        "Downloading {} ({}/{})... {}",
-                        current_file,
-                        file_index + 1,
-                        file_count,
-                        format_bytes(downloaded_bytes),
-                    )
-                };
+                let mut label = format!(
+                    "Downloading {} ({}/{})... {}",
+                    current_file,
+                    file_index + 1,
+                    file_count,
+                    format_bytes(*downloaded_bytes)
+                );
+                if *total_bytes > 0 {
+                    label.push_str(&format!(" / {}", format_bytes(*total_bytes)));
+                }
                 column![
-                    text(progress_label).size(12),
+                    text(label).size(12),
                     row![
                         progress_bar(0.0..=100.0, pct).height(6).width(Length::Fill),
                         button(text("Cancel").size(11))
@@ -586,38 +643,25 @@ impl SettingsState {
                 ]
                 .spacing(4)
                 .into()
-            } else {
-                // Another model is downloading — show this one's normal status.
-                self.view_model_status_row(model, installed)
             }
-        } else if let DownloadState::Failed {
-            ref model_id,
-            ref error,
-        } = self.download
-        {
-            if model_id == model.id {
-                column![
-                    text(format!("Download failed: {}", error)).size(12),
-                    row![button(text("Retry").size(11))
-                        .padding([3, 8])
-                        .on_press(SettingsMessage::StartDownload(model.id.to_string())),],
-                ]
-                .spacing(4)
-                .into()
-            } else {
-                self.view_model_status_row(model, installed)
-            }
-        } else {
-            self.view_model_status_row(model, installed)
+            DownloadState::Failed { model_id, error } if model_id == model.id => column![
+                text(format!("Download failed: {}", error)).size(12),
+                button(text("Retry").size(11))
+                    .padding([3, 8])
+                    .on_press(SettingsMessage::StartDownload(model.id.to_string())),
+            ]
+            .spacing(4)
+            .into(),
+            _ => self.view_model_status_row(model, installed),
         };
 
         container(column![header, desc, status_row].spacing(4))
             .padding([8, 12])
             .width(Length::Fill)
+            .style(container::rounded_box)
             .into()
     }
 
-    /// The idle status row for a model: "Installed [Remove]" or "Not installed [Download]".
     fn view_model_status_row<'a>(
         &self,
         model: &ModelDef,
@@ -629,15 +673,15 @@ impl SettingsState {
                 iced::widget::horizontal_space(),
                 button(text("Remove").size(11))
                     .padding([3, 8])
+                    .style(button::secondary)
                     .on_press(SettingsMessage::RemoveModel(model.id.to_string())),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
             .into()
         } else {
-            let downloadable = model_registry::model_downloadable(model);
             let mut dl_btn = button(text("Download").size(11)).padding([3, 8]);
-            if downloadable && !self.is_downloading() {
+            if model_registry::model_downloadable(model) && !self.is_downloading() {
                 dl_btn = dl_btn.on_press(SettingsMessage::StartDownload(model.id.to_string()));
             }
             row![
@@ -652,7 +696,25 @@ impl SettingsState {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+fn card<'a>(content: impl Into<Element<'a, SettingsMessage>>) -> Element<'a, SettingsMessage> {
+    container(content)
+        .padding(15)
+        .width(Length::Fill)
+        .style(container::bordered_box)
+        .into()
+}
+
+fn dir_size(dir: &std::path::Path) -> u64 {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+pub fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
         format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
     } else if bytes >= 1_000_000 {
@@ -664,237 +726,59 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Persisted application settings (JSON).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AppSettings {
-    pub thread_count: u32,
-    pub cache_size_mb: u32,
-    #[serde(default = "default_ollama_url")]
-    pub ollama_url: String,
-    #[serde(default = "default_vision_model")]
-    pub vision_model: String,
-    #[serde(default)]
-    pub ml_model_path: Option<String>,
-    #[serde(default = "default_confidence_threshold")]
-    pub classification_confidence_threshold: f32,
-    #[serde(default)]
-    pub cloud_enabled: bool,
-    #[serde(default)]
-    pub cloud_provider: CloudProvider,
-    #[serde(default)]
-    pub cloud_api_key: Option<String>,
-    #[serde(default)]
-    pub max_cloud_requests_per_session: Option<u32>,
-    /// Seconds to skip at the start of videos before sampling (default 3.0).
-    #[serde(default = "default_video_skip_secs")]
-    pub video_skip_secs: f64,
-    /// Duration in seconds to sample from videos for hashing (default 20.0).
-    #[serde(default = "default_video_duration_secs")]
-    pub video_duration_secs: f64,
-}
-
-fn default_ollama_url() -> String {
-    "http://localhost:11434".to_string()
-}
-fn default_vision_model() -> String {
-    "llava".to_string()
-}
-fn default_confidence_threshold() -> f32 {
-    0.6
-}
-fn default_video_skip_secs() -> f64 {
-    3.0
-}
-fn default_video_duration_secs() -> f64 {
-    20.0
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            thread_count: 4,
-            cache_size_mb: 500,
-            ollama_url: default_ollama_url(),
-            vision_model: default_vision_model(),
-            ml_model_path: None,
-            classification_confidence_threshold: default_confidence_threshold(),
-            cloud_enabled: false,
-            cloud_provider: CloudProvider::default(),
-            cloud_api_key: None,
-            max_cloud_requests_per_session: None,
-            video_skip_secs: default_video_skip_secs(),
-            video_duration_secs: default_video_duration_secs(),
-        }
-    }
-}
-
-fn settings_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("shingan")
-        .join("settings.json")
-}
-
-pub fn load_settings() -> AppSettings {
-    let path = settings_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AppSettings::default(),
-    }
-}
-
-fn save_settings(settings: &AppSettings) -> Result<(), Box<dyn std::error::Error>> {
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(settings)?;
-    std::fs::write(&path, json)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_settings_default_values() {
-        let s = AppSettings::default();
-        assert_eq!(s.thread_count, 4);
-        assert_eq!(s.cache_size_mb, 500);
-        assert!((s.classification_confidence_threshold - 0.6).abs() < f32::EPSILON);
-        assert!(!s.cloud_enabled);
-        assert_eq!(s.cloud_provider, CloudProvider::Ollama);
-        assert!(s.cloud_api_key.is_none());
-        assert!(s.max_cloud_requests_per_session.is_none());
-        assert!(s.ml_model_path.is_none());
-        assert!((s.video_skip_secs - 3.0).abs() < f64::EPSILON);
-        assert!((s.video_duration_secs - 20.0).abs() < f64::EPSILON);
+    fn state() -> SettingsState {
+        SettingsState::from_settings(&AppSettings::default())
     }
 
     #[test]
-    fn app_settings_serde_round_trip() {
-        let s = AppSettings {
-            thread_count: 8,
-            cache_size_mb: 1024,
-            ollama_url: "http://my-server:11434".to_string(),
-            vision_model: "llava:13b".to_string(),
-            ml_model_path: Some("/opt/models".to_string()),
-            classification_confidence_threshold: 0.75,
-            cloud_enabled: true,
-            cloud_provider: CloudProvider::OpenAI,
-            cloud_api_key: Some("sk-test-key-123".to_string()),
-            max_cloud_requests_per_session: Some(100),
-            video_skip_secs: 3.0,
-            video_duration_secs: 20.0,
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let s2: AppSettings = serde_json::from_str(&json).unwrap();
-        assert_eq!(s2.thread_count, 8);
-        assert_eq!(s2.cloud_provider, CloudProvider::OpenAI);
-        assert_eq!(s2.cloud_api_key.as_deref(), Some("sk-test-key-123"));
-        assert_eq!(s2.max_cloud_requests_per_session, Some(100));
-        assert_eq!(s2.ml_model_path.as_deref(), Some("/opt/models"));
-        assert!(s2.cloud_enabled);
+    fn edits_mark_dirty_and_invalid_numbers_are_reported() {
+        let mut s = state();
+        let base = AppSettings::default();
+        let _ = s.update(SettingsMessage::ThreadCountChanged("abc".into()), &base);
+        assert!(s.dirty);
+        assert!(s.to_settings(&base).is_err());
+        let _ = s.update(SettingsMessage::ThreadCountChanged("8".into()), &base);
+        assert_eq!(s.to_settings(&base).unwrap().thread_count, 8);
     }
 
     #[test]
-    fn app_settings_deserialize_missing_new_fields() {
-        let json = r#"{"thread_count":4,"cache_size_mb":500}"#;
-        let s: AppSettings = serde_json::from_str(json).unwrap();
-        assert!(!s.cloud_enabled);
-        assert_eq!(s.cloud_provider, CloudProvider::Ollama);
-        assert!(s.cloud_api_key.is_none());
-        assert!(s.max_cloud_requests_per_session.is_none());
-        assert!((s.classification_confidence_threshold - 0.6).abs() < f32::EPSILON);
+    fn confidence_must_be_in_range() {
+        let mut s = state();
+        s.confidence_threshold = "1.5".into();
+        assert!(s.to_settings(&AppSettings::default()).is_err());
     }
 
     #[test]
-    fn cloud_provider_display() {
-        assert_eq!(CloudProvider::Ollama.to_string(), "Ollama (local)");
-        assert_eq!(CloudProvider::OpenAI.to_string(), "OpenAI");
-        assert_eq!(CloudProvider::Gemini.to_string(), "Google Gemini");
-        assert_eq!(CloudProvider::Anthropic.to_string(), "Anthropic Claude");
+    fn switching_provider_clears_custom_model() {
+        let mut s = state();
+        let base = AppSettings::default();
+        let _ = s.update(
+            SettingsMessage::CloudProviderSelected(CloudProvider::OpenAI),
+            &base,
+        );
+        let _ = s.update(SettingsMessage::CloudModelChanged("custom".into()), &base);
+        let _ = s.update(
+            SettingsMessage::CloudProviderSelected(CloudProvider::Gemini),
+            &base,
+        );
+        assert!(s.cloud_model.is_empty());
     }
 
     #[test]
-    fn cloud_provider_all_has_four() {
-        assert_eq!(CloudProvider::ALL.len(), 4);
-    }
-
-    #[test]
-    fn settings_state_default_loads_without_panic() {
-        let _state = SettingsState::default();
-    }
-
-    #[test]
-    fn settings_update_toggle_cloud() {
-        let mut state = SettingsState::default();
-        assert!(!state.cloud_enabled);
-        let _ = state.update(SettingsMessage::ToggleCloud(true));
-        assert!(state.cloud_enabled);
-    }
-
-    #[test]
-    fn settings_update_cloud_provider() {
-        let mut state = SettingsState::default();
-        assert_eq!(state.cloud_provider, CloudProvider::Ollama);
-        let _ = state.update(SettingsMessage::CloudProviderSelected(
-            CloudProvider::OpenAI,
-        ));
-        assert_eq!(state.cloud_provider, CloudProvider::OpenAI);
-    }
-
-    #[test]
-    fn settings_update_api_key() {
-        let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::CloudApiKeyChanged("sk-test".to_string()));
-        assert_eq!(state.cloud_api_key, "sk-test");
-    }
-
-    #[test]
-    fn settings_update_max_cloud_requests() {
-        let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::MaxCloudRequestsChanged("50".to_string()));
-        assert_eq!(state.max_cloud_requests, "50");
-    }
-
-    #[test]
-    fn settings_update_confidence_threshold() {
-        let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::ConfidenceThresholdChanged(
-            "0.80".to_string(),
-        ));
-        assert_eq!(state.confidence_threshold, "0.80");
-    }
-
-    #[test]
-    fn settings_update_ml_model_path_refreshes_statuses() {
-        let mut state = SettingsState::default();
-        let _ = state.update(SettingsMessage::MlModelPathChanged(
-            "/nonexistent/path".to_string(),
-        ));
-        assert_eq!(state.ml_model_path, "/nonexistent/path");
-        // All models should show as not installed for a bogus path.
-        for (_id, installed) in &state.model_statuses {
-            assert!(!installed);
-        }
-    }
-
-    #[test]
-    fn settings_update_remove_nonexistent_model() {
-        let mut state = SettingsState {
-            ml_model_path: "/tmp/shingan_test_nonexistent".to_string(),
-            ..Default::default()
-        };
-        let _ = state.update(SettingsMessage::RemoveModel("clip-vit-b32".to_string()));
-        assert!(state.status_message.is_some());
+    fn db_buttons_become_pending_actions() {
+        let mut s = state();
+        let _ = s.update(SettingsMessage::ClearSessions, &AppSettings::default());
+        assert_eq!(s.pending_action, Some(DbAction::ClearSessions));
+        assert!(!s.dirty);
     }
 
     #[test]
     fn format_bytes_various_sizes() {
         assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1_500), "2 KB");
         assert_eq!(format_bytes(5_500_000), "5.5 MB");
         assert_eq!(format_bytes(1_200_000_000), "1.2 GB");

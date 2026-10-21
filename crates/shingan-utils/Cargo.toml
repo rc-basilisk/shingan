@@ -2,12 +2,18 @@
 name = "shingan-utils"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 shingan-core.workspace = true
-shingan-ml.workspace = true
+shingan-ml = { workspace = true, features = ["cloud"] }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 walkdir.workspace = true
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"

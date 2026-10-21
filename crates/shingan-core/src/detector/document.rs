@@ -1,57 +1,52 @@
-use crate::cache::BoundedCache;
-use crate::detector::Detector;
+use crate::detector::{minhash, Detector, PreparedSignatures};
 use crate::error::Result;
 use crate::file_info::FileCategory;
-use parking_lot::Mutex;
 use std::io::Read;
 use std::path::Path;
 
-/// Document duplicate detector using text extraction and fuzzy matching.
+/// Document duplicate detector using text extraction and MinHash.
 ///
-/// Extracts text from TXT, DOCX, ODT, and PDF files, then uses
-/// `token_sort_ratio` for fuzzy comparison.
+/// Extracts text from TXT/SRT/VTT/SUB, RTF, DOC, DOCX, ODT, and PDF files,
+/// lowercases it, and builds a MinHash sketch over 3-word shingles. Similarity
+/// is the Sorensen-Dice coefficient of the shingle sets (see
+/// [`crate::detector::minhash`]).
 pub struct DocumentDetector {
     threshold: f64,
-    cache: Mutex<BoundedCache<String, String>>,
 }
 
 impl DocumentDetector {
     pub fn new(threshold: f64) -> Self {
-        Self {
-            threshold,
-            cache: Mutex::new(BoundedCache::new(1000)),
-        }
+        Self { threshold }
     }
 
-    /// Extract text content from a document file.
-    fn extract_text(&self, path: &Path) -> Option<String> {
-        let key = path.to_string_lossy().to_string();
-
-        {
-            let mut cache = self.cache.lock();
-            if let Some(text) = cache.get(&key) {
-                return Some(text.clone());
-            }
-        }
-
+    /// Extract human-readable text from a supported document, as-is (not
+    /// normalized). Useful for previews.
+    pub fn readable_text(path: &Path) -> Option<String> {
         let ext = path.extension()?.to_str()?.to_lowercase();
-        let text = match ext.as_str() {
-            "txt" | "srt" | "vtt" | "sub" | "rtf" => Self::extract_plain_text(path),
-            "docx" | "doc" => Self::extract_docx(path),
+        match ext.as_str() {
+            "txt" | "srt" | "vtt" | "sub" => Self::extract_plain_text(path),
+            "rtf" => Self::extract_plain_text(path).map(|t| strip_rtf(&t)),
+            "docx" => Self::extract_docx(path),
+            // Legacy .doc is an OLE container; some files named .doc are really DOCX.
+            "doc" => Self::extract_docx(path).or_else(|| Self::extract_legacy_doc(path)),
             "odt" => Self::extract_odt(path),
             "pdf" => Self::extract_pdf(path),
             _ => None,
-        };
+        }
+    }
+
+    /// Extracted text, whitespace-normalized and lowercased for comparison.
+    fn extract_text(&self, path: &Path) -> Option<String> {
+        let text = Self::readable_text(path);
 
         if let Some(ref text) = text {
-            let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized: String = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
             if normalized.len() < 10 {
                 return None;
-            }
-
-            {
-                let mut cache = self.cache.lock();
-                cache.put(key, normalized.clone());
             }
             return Some(normalized);
         }
@@ -181,30 +176,109 @@ impl DocumentDetector {
     /// Extract text from PDF using pdf-extract.
     fn extract_pdf(path: &Path) -> Option<String> {
         let bytes = std::fs::read(path).ok()?;
-        pdf_extract::extract_text_from_mem(&bytes).ok()
+        // pdf-extract can panic on malformed files; don't let one bad PDF kill the scan.
+        std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
+            .ok()?
+            .ok()
     }
+
+    /// Best-effort text from a Word 97-2003 binary document: collect runs of
+    /// printable text stored either as 8-bit characters or UTF-16LE.
+    fn extract_legacy_doc(path: &Path) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut out = String::new();
+
+        // UTF-16LE runs
+        let mut run = String::new();
+        for pair in bytes.as_chunks::<2>().0 {
+            let c = u16::from_le_bytes(*pair);
+            match char::from_u32(c as u32) {
+                Some(ch) if !ch.is_control() || ch == ' ' => run.push(ch),
+                _ => flush_run(&mut run, &mut out),
+            }
+        }
+        flush_run(&mut run, &mut out);
+
+        // 8-bit runs
+        for &b in &bytes {
+            if b.is_ascii_graphic() || b == b' ' {
+                run.push(b as char);
+            } else {
+                flush_run(&mut run, &mut out);
+            }
+        }
+        flush_run(&mut run, &mut out);
+
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+/// Keep runs of at least 8 characters containing a space (likely prose).
+fn flush_run(run: &mut String, out: &mut String) {
+    if run.chars().count() >= 8 && run.contains(' ') {
+        out.push_str(run);
+        out.push(' ');
+    }
+    run.clear();
+}
+
+/// Very small RTF-to-text converter: drops control words, groups and braces.
+fn strip_rtf(rtf: &str) -> String {
+    let mut out = String::with_capacity(rtf.len() / 2);
+    let mut chars = rtf.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                match chars.peek() {
+                    Some('\\') | Some('{') | Some('}') => {
+                        out.push(chars.next().unwrap_or(' '));
+                    }
+                    _ => {
+                        // Skip control word and an optional numeric parameter.
+                        while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                            chars.next();
+                        }
+                        while chars
+                            .peek()
+                            .is_some_and(|c| c.is_ascii_digit() || *c == '-')
+                        {
+                            chars.next();
+                        }
+                        if chars.peek() == Some(&' ') {
+                            chars.next();
+                        }
+                        out.push(' ');
+                    }
+                }
+            }
+            '{' | '}' => {}
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl Detector for DocumentDetector {
     fn compute_signature(&self, path: &Path) -> Result<Option<String>> {
-        match self.extract_text(path) {
-            Some(text) => {
-                use sha2::{Digest, Sha256};
-                let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
-                Ok(Some(hash))
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .extract_text(path)
+            .and_then(|text| minhash::signature_from_tokens(text.split_whitespace(), 3)))
     }
 
-    fn compare_files(&self, file1: &Path, file2: &Path) -> Result<f64> {
-        let text1 = self.extract_text(file1);
-        let text2 = self.extract_text(file2);
+    fn compare_signatures(&self, sig1: &str, sig2: &str) -> f64 {
+        minhash::compare(sig1, sig2)
+    }
 
-        match (text1, text2) {
-            (Some(t1), Some(t2)) => Ok(strsim::sorensen_dice(&t1, &t2)),
-            _ => Ok(0.0),
-        }
+    fn candidate_keys(&self, sig: &str, _threshold: f64) -> Vec<u64> {
+        minhash::band_keys(sig)
+    }
+
+    fn prepare<'a>(&'a self, sigs: &[&'a str]) -> Box<dyn PreparedSignatures + 'a> {
+        Box::new(minhash::PreparedMinHash::new(sigs))
     }
 
     fn category(&self) -> FileCategory {
@@ -226,5 +300,29 @@ mod tests {
         let result = det.compute_signature(Path::new("/nonexistent/path/file.txt"));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn near_duplicate_documents_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..300)
+            .map(|i| format!("sentence number {i} goes here. "))
+            .collect();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, &body).unwrap();
+        std::fs::write(&b, body.replacen("number 7", "NUMBER seven", 1)).unwrap();
+        let det = DocumentDetector::new(0.9);
+        let sa = det.compute_signature(&a).unwrap().unwrap();
+        let sb = det.compute_signature(&b).unwrap().unwrap();
+        assert!(det.compare_signatures(&sa, &sb) > 0.95);
+    }
+
+    #[test]
+    fn rtf_control_words_are_stripped() {
+        let text = strip_rtf(r"{\rtf1\ansi{\fonttbl\f0 Arial;}\f0\fs24 Hello \b world\b0 !}");
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world"));
+        assert!(!text.contains("fs24"));
     }
 }

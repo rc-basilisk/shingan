@@ -1,237 +1,243 @@
 <p align="center">
-  <img src="assets/shingan-logo.png" width="200" alt="shingan logo">
+  <img src="assets/shingan-logo.png" width="180" alt="shingan logo">
 </p>
 
 <h1 align="center">shingan</h1>
 
 <p align="center">
-  <strong>Seeing through files to find the hidden doubles.</strong><br>
-  <em>shingan (心眼) — the mind's eye that perceives what lies beneath the surface.</em>
+  <strong>Find duplicate files, even when they aren't exact copies, and tidy up messy folders.</strong><br>
+  <em>shingan (心眼): "the mind's eye", seeing what lies beneath the surface.</em>
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> &middot;
-  <a href="#installation">Installation</a> &middot;
-  <a href="#usage">Usage</a> &middot;
-  <a href="#ml-categorization-pipeline">ML Pipeline</a> &middot;
-  <a href="#architecture">Architecture</a> &middot;
-  <a href="#license">License</a>
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-it-can-find">What it finds</a> ·
+  <a href="#sorting-folders">Sorting</a> ·
+  <a href="#faq--troubleshooting">FAQ</a> ·
+  <a href="docs/how-it-works.md">How it works</a>
 </p>
 
 ---
 
-shingan is a high-performance file deduplication and organization toolkit written in Rust. It detects duplicate and near-duplicate files across images, videos, documents, code, and archives using perceptual hashing, text similarity, and content-aware analysis. A multi-tier ML categorization pipeline can further sub-classify images into 24 categories for automatic sorting. Everything runs offline and local-first — no cloud accounts required.
+Most duplicate finders only catch byte-for-byte copies. shingan also finds the
+**resized photo**, the **re-saved JPEG**, the **re-encoded video**, the
+**document with one sentence changed**, and the **script that was only reformatted**.
+Everything runs on your own computer. Nothing is uploaded unless you turn on
+the optional cloud classification.
 
-It ships as both a CLI tool and an Iced-based GUI application.
+It comes as a **desktop app** and a **command-line tool**, for Windows, macOS
+(Apple Silicon) and Linux.
 
-## Features
+<p align="center">
+  <img src="assets/screenshots/results.png" width="800" alt="Duplicate groups with thumbnails, similarity scores and one-click selection">
+</p>
 
-- **Perceptual duplicate detection** — finds near-duplicates, not just byte-identical copies
-- **3-phase scanning** — file discovery, parallel signature analysis, union-find fuzzy grouping with strict membership validation
-- **5 detection engines** — image, video, document, code, and archive, each with specialized algorithms
-- **Multi-tier ML image categorization** — heuristics, structural analysis, local ONNX CLIP inference, and optional cloud vision APIs classify images into 24 sub-categories
-- **Offline-first / local-first** — all core functionality works without network access; cloud APIs are opt-in behind feature flags
-- **Pluggable architecture** — compile only the detectors and ML tiers you need via feature flags
-- **Persistent signature cache** — computed signatures stored in SQLite keyed by file path, size, and modification time; rescanning unchanged files skips computation entirely
-- **In-memory LRU caches** — per-detector signature and parse caches (`parking_lot::Mutex`) for fast within-scan comparisons
-- **Auto-sorter** — rule-based file organization with optional ML-powered image sub-categorization
-- **GUI with preview** — image thumbnails, syntax-highlighted code, PDF pages, video frames; paginated results (50 groups/page)
-- **SQLite persistence** — WAL mode, indexed queries, batch inserts with transactions, full scan history
-- **CSV and JSON export** — batch export results in CSV or structured JSON for external processing
-- **Batch deletion** — CLI command to delete duplicates by strategy (keep newest/oldest/largest) with dry-run support
-- **Incremental scanning** — merge new directories into an existing scan session
-- **Dry-run sort** — preview file moves without executing them
-- **Keyboard shortcuts** — Ctrl+1/2/3 tab switching, Ctrl+T theme toggle, Ctrl+Enter start scan
-- **Pause / resume / stop** — full scan lifecycle control
-- **Progress tracking** — elapsed time, ETA, cache hit stats, and similarity histogram in CLI output
+## Highlights
 
-## Detection Capabilities
+- **Near-duplicate detection** for images, videos, documents (PDF, Word, ODT, text, subtitles) and source code, plus exact matching for archives.
+- **Safe cleanup.** Removed files go to the **trash / recycle bin** by default, at least one copy of every group is **always kept**, and you confirm before anything happens.
+- **Auto-sort.** Moves files into `images/`, `documents/`, `videos/`, ... with a **preview mode** and **one-click undo**.
+- **Optional local AI** to sort images into folders like `photo_landscape`, `screenshot_desktop`, `meme` or `diagram`. Runs offline.
+- **Fast re-scans.** Fingerprints are cached, so unchanged files are skipped next time.
+- **Scan history.** Reopen earlier results, export them to CSV or JSON.
 
-| Category | Algorithm | Details |
-|----------|-----------|---------|
-| Image | Multi-hash perceptual (aHash + pHash + dHash) | 12x12 bit hashes via `img_hash`; all three must agree; 5000-entry signature cache + 10000-entry parse cache |
-| Video | 3D DCT perceptual (`vid_dup_finder_lib` + FFmpeg) | Configurable sampling window (default: skip 3s, sample 20s); 1000-entry signature cache + 2000-entry parse cache |
-| Document | Text extraction + Sorensen-Dice coefficient | Supports PDF, DOCX, ODT, TXT, SRT, VTT, SUB, RTF |
-| Code | Normalization + Sorensen-Dice coefficient | Strips comments and whitespace; syntax-aware comparison |
-| Archive | SHA-256 exact match | Byte-for-byte content comparison |
+## Install
 
-## Supported Formats
+Download the latest build for your system from the
+[**Releases page**](https://github.com/rc-basilisk/shingan/releases/latest):
 
-| Type | Extensions |
-|-----------|------------|
-| Images | jpg, jpeg, png, gif, bmp, webp, tiff, svg |
-| Documents | txt, doc, docx, odt, pdf, rtf, srt, vtt, sub |
-| Videos | mp4, avi, mkv, mov, wmv, flv, webm, m4v |
-| Archives | zip, tar, gz, bz2, xz, 7z, rar, zst |
-| Code | py, js, ts, exs, html, css, jsx, tsx, vue, rs, go, cpp, c, h |
+| System | Desktop app | Command line |
+|---|---|---|
+| Windows (x64) | `shingan-gui-x86_64-pc-windows-msvc.zip` | `shingan-cli-x86_64-pc-windows-msvc.zip` |
+| macOS (Apple Silicon) | `shingan-gui-aarch64-apple-darwin.tar.xz` | `shingan-cli-aarch64-apple-darwin.tar.xz` |
+| Linux (x64) | `shingan-gui-x86_64-unknown-linux-gnu.tar.xz` | `shingan-cli-x86_64-unknown-linux-gnu.tar.xz` |
 
-## ML Categorization Pipeline
+Unpack it and run `shingan-gui` (or `shingan` from a terminal). There is
+nothing else to install for images, documents, code and archives.
 
-When sorting images, shingan can sub-classify them into 24 categories using a multi-tier pipeline that escalates from cheap heuristics to heavier inference only when needed.
+<details>
+<summary>One-line installers (put the program on your PATH)</summary>
 
-### Tiers
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rc-basilisk/shingan/releases/latest/download/shingan-gui-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rc-basilisk/shingan/releases/latest/download/shingan-cli-installer.sh | sh
+```
 
-| Tier | Method | Cost | What it does |
-|------|--------|------|--------------|
-| **0** | Heuristics | ~0 ms | Resolution matching, EXIF presence, aspect ratio analysis. Catches screenshots, icons, and camera photos with high confidence. |
-| **1** | Structure signals | ~5 ms | Pixel brightness, edge energy, perceptual hash stats. Identifies diagrams and scanned documents. |
-| **2** | ONNX CLIP | ~50 ms | Runs a local CLIP ViT-B/32 image encoder and compares against precomputed text prototype vectors for all 24 categories via cosine similarity. |
-| **3** | Cloud (optional) | ~500 ms | Sends the image to a vision-capable API (Ollama, OpenAI, or Gemini) for classification. Only fires when Tier 2 confidence is below threshold. |
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/rc-basilisk/shingan/releases/latest/download/shingan-gui-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/rc-basilisk/shingan/releases/latest/download/shingan-cli-installer.ps1 | iex"
+```
+</details>
 
-Each tier has a configurable confidence threshold. If a tier's result exceeds its threshold, the pipeline stops and returns that result. Otherwise it escalates to the next tier.
+### Optional extras
 
-### 24 Image Sub-Categories
+| For | Install | Why |
+|---|---|---|
+| Comparing **videos** | [FFmpeg](https://ffmpeg.org/download.html) (`ffmpeg` and `ffprobe` on your PATH) | shingan uses it to read video frames |
+| PDF page previews in the app | Poppler (`pdftoppm`) | Without it, PDFs are previewed as text |
+| Sorting images into sub-folders | Nothing. Click **Download** in *Settings*, or run `shingan model download` | Fetches the ~340 MB image model plus ONNX Runtime |
 
-Grouped by type:
+Windows: `winget install ffmpeg` · macOS: `brew install ffmpeg poppler` ·
+Debian/Ubuntu: `sudo apt install ffmpeg poppler-utils`
 
-| Group | Categories |
-|-------|------------|
-| **Screenshots** | `screenshot_desktop`, `screenshot_mobile`, `screen_recording_frame` |
-| **Photos** | `photo_landscape`, `photo_portrait`, `photo_food`, `photo_animal`, `photo_architecture`, `photo_event`, `photo_product`, `photo_general` |
-| **Art** | `artwork`, `anime_manga`, `pixel_art`, `comic`, `render_3d` |
-| **Memes** | `meme` |
-| **Info-dense** | `diagram`, `infographic_chart`, `scanned_document`, `handwritten` |
-| **Design** | `ui_design`, `logo_icon` |
-| **Fallback** | `other` |
+Run `shingan doctor` at any time to see which of these are available.
 
-### Model files
+## Quick start
 
-Tier 2 requires one model file: `clip_image.onnx` (CLIP ViT-B/32 image encoder, ~340 MB). The category prototype vectors are embedded in the binary at compile time.
+### Desktop app
 
-The model can be downloaded directly from the **Settings > Local ML Categorization** panel in the GUI, which shows download progress and status. Alternatively, place the file manually in `$XDG_DATA_HOME/shingan/models/` (typically `~/.local/share/shingan/models/`).
+1. **Find duplicates** tab: *Add folder*, tick the file types to compare, then **Start scan**.
+   (You can also start it as `shingan-gui ~/Pictures` to pre-fill a folder.)
+2. Results open automatically. Click a thumbnail to preview it, or click a folder name to show the file in your file manager.
+3. Pick what to keep with **Oldest / Newest / Largest / Shortest path**, or tick files by hand.
+4. Press **Move to trash…** and confirm. At least one copy of each group always stays.
 
-If the model file is absent, Tier 2 is silently skipped.
+<p align="center">
+  <img src="assets/screenshots/finder.png" width="640" alt="Scan setup screen">
+</p>
 
-## Installation
+Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>
+switch tabs, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> starts a scan,
+<kbd>Ctrl</kbd>+<kbd>T</kbd> toggles light/dark, <kbd>Esc</kbd> closes a
+preview or the results (<kbd>⌘</kbd> instead of <kbd>Ctrl</kbd> on macOS).
 
-### Prerequisites
+### Command line
 
-- **Rust 1.80+**
-- **FFmpeg / ffprobe** on `PATH` (required for video detection)
-- **ONNX Runtime** libraries (auto-fetched by `ort` crate when building with the `onnx` feature)
-- **Ollama** running locally (optional, for cloud-tier ML categorization)
+```sh
+shingan scan ~/Pictures                    # images + documents (the default)
+shingan scan ~/Downloads -t all -T 0.9     # every file type, 90% similarity
+shingan list                               # past scans
+shingan list 3                             # groups found by scan #3
+shingan delete 3 --keep oldest --dry-run   # preview the cleanup
+shingan delete 3 --keep oldest             # move extra copies to the trash (asks first)
+shingan export 3 -o dupes.json             # CSV or JSON, picked from the extension
+```
 
-### Build from source
+`-t` takes `image`, `document`, `video`, `archive`, `code` or `all`,
+comma-separated. `--keep` takes `oldest`, `newest`, `largest` or
+`shortest-path`. Add `--permanent` to `delete` to skip the trash.
+Run `shingan help <command>` for every option.
 
-```bash
+## What it can find
+
+| Type | Extensions | Counts as a duplicate when |
+|---|---|---|
+| Images | jpg, jpeg, png, gif, bmp, webp, tiff | they look the same, even resized, recompressed or converted |
+| Videos | mp4, mkv, mov, avi, webm, wmv, flv, m4v | the footage matches, even re-encoded or at another resolution |
+| Documents | pdf, docx, doc, odt, rtf, txt, srt, vtt, sub | the text is (nearly) the same, regardless of formatting |
+| Code | py, js, ts, jsx, tsx, rs, go, c, cpp, h, html, css, vue, exs | the code matches after ignoring comments and whitespace |
+| Archives | zip, tar, gz, bz2, xz, 7z, rar, zst | byte-for-byte identical |
+
+**The similarity slider** (default 95%) controls how alike files must be.
+100% finds only identical content. 90-95% catches resized or re-saved copies
+and lightly edited documents. Below about 85% you'll start seeing files that
+are merely similar, so review before deleting.
+
+Limits worth knowing: heavily **cropped** or rotated images aren't matched,
+scanned PDFs without a text layer can't be compared by content, and files
+smaller than 1 KiB are skipped (configurable).
+
+## Sorting folders
+
+**Auto-sort** moves files into one folder per type: `images/`, `documents/`,
+`videos/`, `archives/`, `code/`, and `others/` for everything else.
+
+- **Preview only** is on by default: you see every planned move before anything happens.
+- Hidden files and tool folders (`.git`, `node_modules`, ...) are never touched, and the destination may live inside the folder being sorted.
+- Every real sort can be **undone**: click *Undo this sort*, or run `shingan undo-sort <destination>`.
+- Name clashes become `name_1.jpg`, `name_2.jpg`, ..., so nothing is overwritten.
+
+```sh
+shingan sort ~/Downloads -d ~/Sorted --dry-run     # preview
+shingan sort ~/Downloads -d ~/Sorted --classify    # also sort images into sub-folders
+shingan undo-sort ~/Sorted                         # put everything back
+```
+
+### Image sub-folders (optional AI)
+
+With **Sort images into sub-folders** (or `--classify`), images are filed into
+one of 24 categories:
+
+| Group | Folders |
+|---|---|
+| Photos | `photo_landscape`, `photo_portrait`, `photo_food`, `photo_animal`, `photo_architecture`, `photo_event`, `photo_product`, `photo_general` |
+| Screens | `screenshot_desktop`, `screenshot_mobile`, `screen_recording_frame` |
+| Art | `artwork`, `anime_manga`, `pixel_art`, `comic`, `render_3d` |
+| Info | `diagram`, `infographic_chart`, `scanned_document`, `handwritten` |
+| Other | `meme`, `ui_design`, `logo_icon`, `other` |
+
+This uses a CLIP image model that runs **offline on your computer**. Download
+it once from *Settings → Image sub-categories → Download*, or run
+`shingan model download`. Without it, only simple rules apply (screenshots by
+resolution, icons by size, camera photos by EXIF), and most images land in `other`.
+
+Images the model isn't sure about go to `images/other`. Raise or lower
+*Minimum confidence* in Settings to make that stricter or looser.
+
+**Cloud classification** (off by default) can ask a vision model about the
+images the local model is unsure of: [Ollama](https://ollama.com) running on
+your machine, or OpenAI, Google Gemini or Anthropic Claude with your own API
+key. Images are shrunk to 768 px before sending. You can cap the number of
+requests per sort. API keys can be stored in Settings or read from
+`OPENAI_API_KEY`, `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`.
+
+## FAQ & troubleshooting
+
+**Is it safe?** Removal goes to the trash by default, at least one copy per
+group is always kept, files that vanished since the scan are skipped, and both
+the app and `shingan delete` ask before acting. Sorting has a preview mode and
+an undo journal. Still: you're deleting files, so review the groups first.
+
+**"Videos" finds nothing / video files are skipped.** Install FFmpeg so that
+`ffmpeg` and `ffprobe` work in a terminal, then rescan. `shingan doctor` checks this.
+
+**Image sub-folders don't work.** Run `shingan doctor`. Both *CLIP model* and
+*ONNX Runtime* should say `ok`. Downloading the model also downloads ONNX
+Runtime. If you already have ONNX Runtime 1.18 or newer installed elsewhere,
+point `ORT_DYLIB_PATH` at its library file.
+
+**macOS says the app "can't be opened".** The builds aren't signed. Right-click
+the program and choose *Open*, or run
+`xattr -d com.apple.quarantine shingan-gui` once.
+
+**Windows SmartScreen warns about the download.** Choose *More info → Run
+anyway*. The builds aren't signed.
+
+**Linux: the app doesn't start.** It needs a desktop session with the usual
+X11/Wayland libraries (`libxkbcommon-x11`, `libwayland`, OpenGL/Vulkan
+drivers), which all mainstream desktops ship.
+
+**Where is my data?** Run `shingan doctor` to print the exact paths.
+
+| What | Linux | macOS | Windows |
+|---|---|---|---|
+| Scan history and fingerprint cache | `~/.local/share/shingan/shingan.db` | `~/Library/Application Support/shingan/shingan.db` | `%LOCALAPPDATA%\shingan\shingan.db` |
+| Image model | `~/.local/share/shingan/models/` | `~/Library/Application Support/shingan/models/` | `%LOCALAPPDATA%\shingan\models\` |
+| Settings | `~/.config/shingan/settings.json` | `~/Library/Application Support/shingan/settings.json` | `%APPDATA%\shingan\settings.json` |
+| Thumbnails | `~/.cache/shingan/` | `~/Library/Caches/shingan/` | `%LOCALAPPDATA%\shingan\` |
+
+Deleting these folders resets shingan completely.
+
+## Building from source
+
+You need [Rust](https://rustup.rs) 1.88 or newer. On Linux, also install the
+GUI build dependencies (Debian/Ubuntu:
+`sudo apt install pkg-config libxkbcommon-dev libwayland-dev libgl-dev libegl-dev libdbus-1-dev`).
+
+```sh
 git clone https://github.com/rc-basilisk/shingan.git
 cd shingan
-cargo build --release
-```
-
-The `shingan` binary will be at `target/release/shingan`.
-
-### Feature flags
-
-Detection engines (on `shingan-core`):
-
-```bash
-# All detectors (default)
-cargo build --release
-
-# Only image and document detection
-cargo build --release --no-default-features --features image-detect,document-detect
-```
-
-Available: `image-detect`, `document-detect`, `code-detect`, `video-detect`.
-
-ML pipeline (on `shingan-ml`):
-
-| Flag | Effect |
-|------|--------|
-| `onnx` (default) | Local CLIP inference via ONNX Runtime |
-| `cloud-ollama` | Ollama vision API categorizer |
-| `cloud-openai` | OpenAI vision API categorizer |
-| `cloud-gemini` | Google Gemini vision API categorizer |
-
-## Usage
-
-### CLI
-
-```bash
-# Scan directories for image and document duplicates with 95% similarity threshold
-shingan scan ~/Photos ~/Documents -t image,document -T 0.95
-
-# Scan with a custom session name
-shingan scan ~/Photos -t image --name "Photo cleanup March 2026"
-
-# Merge new directories into an existing scan session
-shingan scan ~/MorePhotos -t image --merge-session 1
-
-# Sort files into category directories
-shingan sort ~/Downloads --dest ~/Sorted
-
-# Sort with ML-powered image sub-categorization
-shingan sort ~/Downloads --dest ~/Sorted --classify
-
-# Preview sort results without moving files
-shingan sort ~/Downloads --dest ~/Sorted --dry-run
-
-# List results from previous scans (includes similarity histogram)
-shingan list
-shingan list <SESSION_ID>
-
-# Export a scan session to CSV or JSON
-shingan export <SESSION_ID> -o results.csv
-shingan export <SESSION_ID> -o results.json -f json
-
-# Delete duplicates, keeping the newest file in each group
-shingan delete <SESSION_ID> --keep newest
-
-# Preview deletions without removing files
-shingan delete <SESSION_ID> --keep largest --dry-run
-```
-
-### GUI
-
-```bash
-# Launch the graphical interface
+cargo build --release            # binaries end up in target/release/
 cargo run --release -p shingan-gui
 ```
 
-The GUI provides tabbed access to the duplicate finder, auto-sorter, and settings. It supports dark and light themes, inline file preview, and batch deletion of duplicates.
-
-The **Settings** tab lets you configure:
-
-- **Performance** — scanner threads, thumbnail cache size, video sampling parameters (skip intro duration, sample length)
-- **Local ML** — model manager (download, remove, status), confidence threshold for tier escalation, custom model directory
-- **Cloud APIs** — cloud provider selection (Ollama/OpenAI/Gemini/Anthropic), API key input, Ollama URL + model name, max requests per session cost guardrail
-- **Database** — clear sessions, optimize/vacuum
-- **Cache** — clear thumbnail cache
-
-**Keyboard shortcuts:** Ctrl+1/2/3 switches tabs, Ctrl+T toggles the theme, Ctrl+Enter starts a scan.
-
-All settings persist to `~/.config/shingan/settings.json` and are applied on the next sort run.
-
-<!-- TODO: add screenshot -->
-
-## Architecture
-
-shingan is organized as a Cargo workspace with six crates:
-
-| Crate | Role |
-|-------|------|
-| `shingan-core` | Core detection engine with the pluggable `Detector` trait, LSH grouping, scan orchestration, file metadata enrichment |
-| `shingan-ml` | Multi-tier image classification pipeline (heuristics, structure analysis, ONNX CLIP, cloud APIs) |
-| `shingan-db` | SQLite persistence layer (WAL mode, bundled via `rusqlite`) |
-| `shingan-utils` | File sorting utilities integrating `shingan-ml` for image sub-categorization |
-| `shingan-cli` | CLI binary (`shingan`) exposing scan, list, export, sort, and delete commands |
-| `shingan-gui` | Iced-based GUI with duplicate finder, auto-sorter, and settings tabs |
-
-### Key design decisions
-
-- **Pluggable `Detector` trait** — each file category implements a common interface for signature computation and comparison, making it straightforward to add new detection strategies.
-- **Two-tier LRU caching** — each detector maintains a bounded signature cache, and image/video detectors add a second parse cache to avoid re-deserializing signatures during pairwise comparisons. All caches use `parking_lot::Mutex` for non-poisoning, low-contention locking.
-- **Union-find grouping** — duplicate candidates are clustered using LSH prefix bucketing, then merged via a union-find structure with path compression and union-by-rank. An incrementally maintained member map avoids O(n) scans per merge. Strict cross-validation before each merge ensures every file in a group is similar to every other file.
-- **Escalating ML pipeline** — image classification starts with ~0 ms heuristics and only escalates to heavier ONNX inference or cloud APIs when confidence is insufficient, keeping average per-image cost low.
-- **rayon** — signature computation is parallelized across available cores.
-- **crossbeam-channel** — progress updates flow from worker threads to the UI without blocking.
-- **Persistent signature cache** — a `signature_cache` table stores computed signatures keyed by `(file_path, file_size, modified_at, category)`. On rescan, unchanged files resolve from cache in microseconds instead of recomputing from disk.
-- **Batch DB inserts** — duplicate groups are persisted in a single SQLite transaction, reducing lock contention and improving write throughput.
-- **Indexed queries** — `file_path` and `created_at` columns are indexed for fast lookups and session listing.
+See [docs/development.md](docs/development.md) for the project layout, tests
+and the release process, and [docs/how-it-works.md](docs/how-it-works.md) for
+the detection algorithms and the image-classification pipeline.
 
 ## License
 
-This project is released into the public domain under [CC0 1.0 Universal](LICENSE).
-
-To the extent possible under law, the author has waived all copyright and related or neighboring rights to this work.
+Released into the public domain under [CC0 1.0 Universal](LICENSE).

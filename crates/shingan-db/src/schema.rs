@@ -1,7 +1,30 @@
 use rusqlite::Connection;
 
-/// Create all tables if they don't exist. Enables WAL mode.
+/// Current schema version, stored in SQLite's `user_version` pragma.
+///
+/// - 1: initial schema (v0.1.x)
+/// - 2: signature formats changed (MinHash for text, pHash for images, v2 tags);
+///   cached v1 signatures are discarded.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Create all tables if they don't exist, enable WAL mode and run migrations.
 pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
+    create_tables(conn)?;
+    migrate(conn)
+}
+
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        conn.execute("DELETE FROM signature_cache", [])?;
+    }
+    if version < SCHEMA_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    }
+    Ok(())
+}
+
+fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
     conn.execute_batch(

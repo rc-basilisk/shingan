@@ -25,4 +25,4 @@ pub mod models;
 pub mod repository;
 pub mod schema;
 
-pub use repository::Database;
+pub use repository::{default_db_path, Database};

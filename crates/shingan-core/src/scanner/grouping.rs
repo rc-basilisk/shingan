@@ -1,6 +1,9 @@
 use crate::detector::Detector;
-use std::collections::{HashMap, HashSet};
+use crate::scanner::duplicate::ScanControl;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct DuplicateGroup {
@@ -8,6 +11,11 @@ pub struct DuplicateGroup {
     pub similarity: f64,
 }
 
+/// Progress callback: `(comparisons_done, comparisons_total)`. May be called from
+/// several threads.
+pub type GroupingProgress<'a> = Option<&'a (dyn Fn(usize, usize) + Sync)>;
+
+/// Group files whose signatures are byte-identical.
 pub fn find_exact_groups(file_signatures: &HashMap<PathBuf, String>) -> Vec<DuplicateGroup> {
     let mut sig_to_files: HashMap<&str, Vec<PathBuf>> = HashMap::new();
     for (path, sig) in file_signatures {
@@ -17,14 +25,29 @@ pub fn find_exact_groups(file_signatures: &HashMap<PathBuf, String>) -> Vec<Dupl
             .push(path.clone());
     }
 
-    sig_to_files
+    let mut groups: Vec<DuplicateGroup> = sig_to_files
         .into_values()
         .filter(|files| files.len() >= 2)
-        .map(|files| DuplicateGroup {
-            files,
-            similarity: 1.0,
+        .map(|mut files| {
+            files.sort();
+            DuplicateGroup {
+                files,
+                similarity: 1.0,
+            }
         })
-        .collect()
+        .collect();
+    sort_groups(&mut groups);
+    groups
+}
+
+/// Largest/most similar groups first, ties broken by path for stable output.
+fn sort_groups(groups: &mut [DuplicateGroup]) {
+    groups.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.files.first().cmp(&b.files.first()))
+    });
 }
 
 struct UnionFind {
@@ -40,162 +63,216 @@ impl UnionFind {
         }
     }
 
-    fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find(self.parent[x]);
-            self.parent[x]
-        } else {
-            x
+    fn find(&mut self, mut x: usize) -> usize {
+        // Iterative path halving: no recursion depth issues on huge inputs.
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
         }
+        x
     }
 
-    fn union(&mut self, a: usize, b: usize) -> bool {
+    fn union(&mut self, a: usize, b: usize) -> usize {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
-            return false;
+            return ra;
         }
-        if self.rank[ra] < self.rank[rb] {
-            self.parent[ra] = rb;
-        } else if self.rank[ra] > self.rank[rb] {
-            self.parent[rb] = ra;
-        } else {
-            self.parent[rb] = ra;
-            self.rank[ra] += 1;
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => {
+                self.parent[ra] = rb;
+                rb
+            }
+            std::cmp::Ordering::Greater => {
+                self.parent[rb] = ra;
+                ra
+            }
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+                ra
+            }
         }
-        true
     }
 }
 
+/// Smallest key present in both sorted, de-duplicated key lists.
+fn first_common_key(a: &[u64], b: &[u64]) -> Option<u64> {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return Some(a[i]),
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    None
+}
+
+/// Cluster near-duplicate files.
+///
+/// 1. Each signature is mapped to locality-sensitive bucket keys
+///    ([`Detector::candidate_keys`]); only files sharing a bucket are compared.
+/// 2. Candidate pairs are compared in parallel; pairs at or above `threshold`
+///    are kept.
+/// 3. Pairs are merged most-similar-first with a union-find, and a merge is only
+///    accepted if *every* member of one cluster is similar to every member of
+///    the other. This prevents chaining (A~B, B~C but A!~C).
 pub fn find_fuzzy_groups(
     file_signatures: &HashMap<PathBuf, String>,
     detector: &dyn Detector,
     threshold: f64,
-    prefix_len: usize,
-    progress: Option<&dyn Fn(usize, usize)>,
+    progress: GroupingProgress<'_>,
+    control: Option<&ScanControl>,
 ) -> Vec<DuplicateGroup> {
-    let indexed: Vec<&PathBuf> = file_signatures.keys().collect();
-
-    let mut prefix_buckets: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, path) in indexed.iter().enumerate() {
-        let sig = &file_signatures[*path];
-        let prefix = if sig.len() >= prefix_len {
-            &sig[..prefix_len]
-        } else {
-            sig.as_str()
-        };
-        prefix_buckets.entry(prefix).or_default().push(i);
+    // Sort for deterministic results regardless of HashMap iteration order.
+    let mut entries: Vec<(&PathBuf, &str)> = file_signatures
+        .iter()
+        .map(|(p, s)| (p, s.as_str()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let paths: Vec<&PathBuf> = entries.iter().map(|e| e.0).collect();
+    let sigs: Vec<&str> = entries.iter().map(|e| e.1).collect();
+    let n = sigs.len();
+    if n < 2 {
+        return Vec::new();
     }
 
-    let total_comparisons: usize = prefix_buckets
-        .values()
-        .map(|b| b.len() * (b.len().saturating_sub(1)) / 2)
-        .sum();
+    let prepared = detector.prepare(&sigs);
+    let keys: Vec<Vec<u64>> = sigs
+        .par_iter()
+        .map(|s| {
+            let mut k = detector.candidate_keys(s, threshold);
+            k.sort_unstable();
+            k.dedup();
+            k
+        })
+        .collect();
 
-    let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
-    let mut similar_pairs: Vec<(usize, usize, f64)> = Vec::new();
-    let mut comparisons_done: usize = 0;
-
-    for bucket in prefix_buckets.values() {
-        if bucket.len() < 2 {
-            continue;
+    let mut bucket_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, ks) in keys.iter().enumerate() {
+        for &k in ks {
+            bucket_map.entry(k).or_default().push(i);
         }
-        for i in 0..bucket.len() {
-            for j in (i + 1)..bucket.len() {
-                let (a, b) = if bucket[i] < bucket[j] {
-                    (bucket[i], bucket[j])
-                } else {
-                    (bucket[j], bucket[i])
-                };
-                if !seen_pairs.insert((a, b)) {
-                    comparisons_done += 1;
-                    continue;
+    }
+    let mut buckets: Vec<(u64, Vec<usize>)> = bucket_map
+        .into_iter()
+        .filter(|(_, m)| m.len() >= 2)
+        .collect();
+    buckets.sort_by_key(|(k, _)| *k);
+
+    let total: usize = buckets
+        .iter()
+        .map(|(_, m)| m.len() * (m.len() - 1) / 2)
+        .sum();
+    let done = AtomicUsize::new(0);
+    let last_report = AtomicUsize::new(0);
+    let report_step = (total / 500).max(1);
+    let stopped = || control.is_some_and(|c| c.is_stopped());
+
+    let mut similar_pairs: Vec<(usize, usize, f64)> = buckets
+        .par_iter()
+        .flat_map(|(key, members)| {
+            let key = *key;
+            let prepared = &prepared;
+            let keys = &keys;
+            let done = &done;
+            let last_report = &last_report;
+            (0..members.len()).into_par_iter().flat_map_iter(move |i| {
+                let mut out = Vec::new();
+                if stopped() {
+                    return out;
                 }
-
-                let sig_a = &file_signatures[indexed[a]];
-                let sig_b = &file_signatures[indexed[b]];
-                let similarity = detector.compare_signatures(sig_a, sig_b);
-                comparisons_done += 1;
-
-                if let Some(cb) = progress {
-                    if comparisons_done.is_multiple_of(100) {
-                        cb(comparisons_done, total_comparisons);
+                let a = members[i];
+                for &b in &members[i + 1..] {
+                    // Only evaluate each pair in the first bucket the two share.
+                    if keys[a].len() > 1 && first_common_key(&keys[a], &keys[b]) != Some(key) {
+                        continue;
+                    }
+                    let sim = prepared.similarity(a, b);
+                    if sim >= threshold {
+                        out.push((a, b, sim));
                     }
                 }
-
-                if similarity >= threshold {
-                    similar_pairs.push((a, b, similarity));
+                let now = done.fetch_add(members.len() - i - 1, Ordering::Relaxed) + members.len()
+                    - i
+                    - 1;
+                if let Some(cb) = progress {
+                    let prev = last_report.load(Ordering::Relaxed);
+                    if now >= prev + report_step
+                        && last_report
+                            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        cb(now, total);
+                    }
                 }
-            }
-        }
+                out
+            })
+        })
+        .collect();
+
+    if stopped() {
+        return Vec::new();
+    }
+    if let Some(cb) = progress {
+        cb(total, total);
     }
 
-    similar_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    similar_pairs.sort_by(|x, y| {
+        y.2.partial_cmp(&x.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then((x.0, x.1).cmp(&(y.0, y.1)))
+    });
 
-    let n = indexed.len();
     let mut uf = UnionFind::new(n);
-    // Maintain root -> members map incrementally to avoid O(n) scans per pair
-    let mut root_members: HashMap<usize, Vec<usize>> = (0..n).map(|i| (i, vec![i])).collect();
+    let mut root_members: HashMap<usize, Vec<usize>> = HashMap::new();
+    let members_of = |root_members: &HashMap<usize, Vec<usize>>, r: usize| -> Vec<usize> {
+        root_members.get(&r).cloned().unwrap_or_else(|| vec![r])
+    };
 
-    for (a, b, _sim) in &similar_pairs {
-        let ra = uf.find(*a);
-        let rb = uf.find(*b);
+    for &(a, b, _) in &similar_pairs {
+        let ra = uf.find(a);
+        let rb = uf.find(b);
         if ra == rb {
             continue;
         }
-
-        let set_a = &root_members[&ra];
-        let set_b = &root_members[&rb];
-
-        let mut all_similar = true;
-        'outer: for &member_a in set_a {
-            let sig_ma = &file_signatures[indexed[member_a]];
-            for &member_b in set_b {
-                let sig_mb = &file_signatures[indexed[member_b]];
-                if detector.compare_signatures(sig_ma, sig_mb) < threshold {
-                    all_similar = false;
-                    break 'outer;
-                }
-            }
-        }
-
+        let set_a = members_of(&root_members, ra);
+        let set_b = members_of(&root_members, rb);
+        let all_similar = set_a.iter().all(|&x| {
+            set_b
+                .iter()
+                .all(|&y| prepared.similarity(x, y) >= threshold)
+        });
         if all_similar {
-            // Merge the smaller set into the larger one in the members map
-            let (keep_root, merge_root) = if root_members[&ra].len() >= root_members[&rb].len() {
-                (ra, rb)
-            } else {
-                (rb, ra)
-            };
-            uf.union(*a, *b);
-            let new_root = uf.find(*a);
-            let merged = root_members.remove(&merge_root).unwrap();
-            let keep = root_members.remove(&keep_root).unwrap();
-            let mut combined = keep;
-            combined.extend(merged);
+            root_members.remove(&ra);
+            root_members.remove(&rb);
+            let new_root = uf.union(a, b);
+            let mut combined = set_a;
+            combined.extend(set_b);
             root_members.insert(new_root, combined);
         }
     }
 
-    root_members
+    let mut groups: Vec<DuplicateGroup> = root_members
         .into_values()
         .filter(|members| members.len() >= 2)
-        .map(|members| {
-            let files: Vec<PathBuf> = members.iter().map(|&i| indexed[i].clone()).collect();
-            let mut min_sim = f64::MAX;
-            for i in 0..members.len() {
-                for j in (i + 1)..members.len() {
-                    let sig_a = &file_signatures[indexed[members[i]]];
-                    let sig_b = &file_signatures[indexed[members[j]]];
-                    let sim = detector.compare_signatures(sig_a, sig_b);
-                    min_sim = min_sim.min(sim);
+        .map(|mut members| {
+            members.sort_unstable();
+            let mut min_sim = 1.0f64;
+            for (i, &x) in members.iter().enumerate() {
+                for &y in &members[i + 1..] {
+                    min_sim = min_sim.min(prepared.similarity(x, y));
                 }
             }
             DuplicateGroup {
-                files,
+                files: members.iter().map(|&i| paths[i].clone()).collect(),
                 similarity: min_sim,
             }
         })
-        .collect()
+        .collect();
+    sort_groups(&mut groups);
+    groups
 }
 
 #[cfg(test)]
@@ -205,7 +282,7 @@ mod tests {
     use crate::error::Result;
     use crate::file_info::FileCategory;
     use proptest::prelude::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     struct MockDetector {
@@ -246,6 +323,10 @@ mod tests {
             Ok(0.0)
         }
 
+        fn candidate_keys(&self, _sig: &str, _threshold: f64) -> Vec<u64> {
+            vec![0]
+        }
+
         fn category(&self) -> FileCategory {
             FileCategory::Image
         }
@@ -265,7 +346,7 @@ mod tests {
     fn test_empty_input() {
         let sigs = HashMap::new();
         let detector = MockDetector::new();
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert!(groups.is_empty());
     }
 
@@ -273,7 +354,7 @@ mod tests {
     fn test_single_file() {
         let sigs = make_sigs(&[("a.png", "sig_a")]);
         let detector = MockDetector::new();
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert!(groups.is_empty());
     }
 
@@ -281,7 +362,7 @@ mod tests {
     fn test_two_identical_files() {
         let sigs = make_sigs(&[("a.png", "sig_x"), ("b.png", "sig_x")]);
         let detector = MockDetector::new();
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 2);
         assert!((groups[0].similarity - 1.0).abs() < f64::EPSILON);
@@ -298,7 +379,7 @@ mod tests {
         let mut detector = MockDetector::new();
         detector.set_similar("sig_a", "sig_b", 0.95);
         detector.set_similar("sig_c", "sig_d", 0.95);
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert_eq!(groups.len(), 2);
         for g in &groups {
             assert_eq!(g.files.len(), 2);
@@ -312,7 +393,7 @@ mod tests {
         detector.set_similar("sig_a", "sig_b", 0.95);
         detector.set_similar("sig_b", "sig_c", 0.95);
         detector.set_similar("sig_a", "sig_c", 0.5);
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 3, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 2);
         let paths: Vec<String> = groups[0]
@@ -331,7 +412,7 @@ mod tests {
         let sigs = make_sigs(&[("a.png", "sig_a"), ("b.png", "sig_b")]);
         let mut detector = MockDetector::new();
         detector.set_similar("sig_a", "sig_b", 0.5);
-        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+        let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
         assert!(groups.is_empty());
     }
 
@@ -416,7 +497,7 @@ mod tests {
                 .map(|(p, s)| (PathBuf::from(p), s.clone()))
                 .collect();
             let detector = MockDetector::new();
-            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
             for group in &groups {
                 prop_assert!(
                     group.similarity >= 0.0 && group.similarity <= 1.0,
@@ -439,7 +520,7 @@ mod tests {
                 .map(|(p, s)| (PathBuf::from(p), s.clone()))
                 .collect();
             let detector = MockDetector::new();
-            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, 2, None);
+            let groups = find_fuzzy_groups(&sigs, &detector, 0.9, None, None);
             // All files should be in a single group
             prop_assert_eq!(groups.len(), 1);
             prop_assert_eq!(groups[0].files.len(), n);
