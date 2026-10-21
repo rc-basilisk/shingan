@@ -178,41 +178,37 @@ pub fn find_fuzzy_groups(
             let keys = &keys;
             let done = &done;
             let last_report = &last_report;
-            (0..members.len())
-                .into_par_iter()
-                .flat_map_iter(move |i| {
-                    let mut out = Vec::new();
-                    if stopped() {
-                        return out;
+            (0..members.len()).into_par_iter().flat_map_iter(move |i| {
+                let mut out = Vec::new();
+                if stopped() {
+                    return out;
+                }
+                let a = members[i];
+                for &b in &members[i + 1..] {
+                    // Only evaluate each pair in the first bucket the two share.
+                    if keys[a].len() > 1 && first_common_key(&keys[a], &keys[b]) != Some(key) {
+                        continue;
                     }
-                    let a = members[i];
-                    for &b in &members[i + 1..] {
-                        // Only evaluate each pair in the first bucket the two share.
-                        if keys[a].len() > 1 && first_common_key(&keys[a], &keys[b]) != Some(key)
-                        {
-                            continue;
-                        }
-                        let sim = prepared.similarity(a, b);
-                        if sim >= threshold {
-                            out.push((a, b, sim));
-                        }
+                    let sim = prepared.similarity(a, b);
+                    if sim >= threshold {
+                        out.push((a, b, sim));
                     }
-                    let now = done.fetch_add(members.len() - i - 1, Ordering::Relaxed)
-                        + members.len()
-                        - i
-                        - 1;
-                    if let Some(cb) = progress {
-                        let prev = last_report.load(Ordering::Relaxed);
-                        if now >= prev + report_step
-                            && last_report
-                                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                                .is_ok()
-                        {
-                            cb(now, total);
-                        }
+                }
+                let now = done.fetch_add(members.len() - i - 1, Ordering::Relaxed) + members.len()
+                    - i
+                    - 1;
+                if let Some(cb) = progress {
+                    let prev = last_report.load(Ordering::Relaxed);
+                    if now >= prev + report_step
+                        && last_report
+                            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        cb(now, total);
                     }
-                    out
-                })
+                }
+                out
+            })
         })
         .collect();
 
@@ -243,9 +239,11 @@ pub fn find_fuzzy_groups(
         }
         let set_a = members_of(&root_members, ra);
         let set_b = members_of(&root_members, rb);
-        let all_similar = set_a
-            .iter()
-            .all(|&x| set_b.iter().all(|&y| prepared.similarity(x, y) >= threshold));
+        let all_similar = set_a.iter().all(|&x| {
+            set_b
+                .iter()
+                .all(|&y| prepared.similarity(x, y) >= threshold)
+        });
         if all_similar {
             root_members.remove(&ra);
             root_members.remove(&rb);

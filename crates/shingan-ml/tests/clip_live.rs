@@ -40,7 +40,11 @@ fn classify_samples() {
             .iter()
             .map(|(i, p)| format!("{} {:.2}", ImageSubCategory::ALL[*i].label(), p))
             .collect();
-        println!("{:<16} {}", f.file_name().unwrap().to_string_lossy(), top.join(" | "));
+        println!(
+            "{:<16} {}",
+            f.file_name().unwrap().to_string_lossy(),
+            top.join(" | ")
+        );
     }
 }
 

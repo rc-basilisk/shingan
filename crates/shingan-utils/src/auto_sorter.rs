@@ -186,7 +186,8 @@ impl AutoSorter {
         }
 
         let mut pipeline = if self.use_ml {
-            let p = TieredPipeline::new(self.pipeline_config.clone()).with_cloud(self.cloud.clone());
+            let p =
+                TieredPipeline::new(self.pipeline_config.clone()).with_cloud(self.cloud.clone());
             if let Some(cb) = status {
                 if let Some(err) = p.onnx_error() {
                     cb(&format!("Local CLIP model unavailable: {err}"));
@@ -236,9 +237,11 @@ impl AutoSorter {
             if !self.dry_run {
                 if let Err(e) = std::fs::create_dir_all(&dest_dir) {
                     stats.failed += 1;
-                    stats
-                        .errors
-                        .push(format!("{}: cannot create {}: {e}", file_path.display(), dest_dir.display()));
+                    stats.errors.push(format!(
+                        "{}: cannot create {}: {e}",
+                        file_path.display(),
+                        dest_dir.display()
+                    ));
                     continue;
                 }
             }
@@ -299,9 +302,17 @@ impl AutoSorter {
         if let Some(cb) = status {
             cb(&format!(
                 "Sorting {}: {} {}, {} failed, {} skipped",
-                if stats.cancelled { "cancelled" } else { "complete" },
+                if stats.cancelled {
+                    "cancelled"
+                } else {
+                    "complete"
+                },
                 stats.moved,
-                if self.dry_run { "would be moved" } else { "moved" },
+                if self.dry_run {
+                    "would be moved"
+                } else {
+                    "moved"
+                },
                 stats.failed,
                 stats.skipped
             ));
@@ -525,7 +536,10 @@ mod tests {
         let undo = undo_sort(&journal).unwrap();
         assert_eq!(undo.restored, 4);
         assert_eq!(undo.failed, 0);
-        assert_eq!(std::fs::read_to_string(src.join("sub/a.txt")).unwrap(), "other a");
+        assert_eq!(
+            std::fs::read_to_string(src.join("sub/a.txt")).unwrap(),
+            "other a"
+        );
         assert!(src.join("pic.png").is_file());
         assert!(!journal.exists());
         assert!(!dest.join("documents").exists());

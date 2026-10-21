@@ -1,7 +1,8 @@
-use crate::tabs::auto_sorter::{AutoSorterState, SorterMessage};
-use crate::tabs::duplicate_finder::{DuplicateFinderState, FinderMessage, ScanState};
-use crate::tabs::settings::{DownloadState, SettingsMessage, SettingsState};
-use crate::theme::AppTheme;
+use crate::tabs::auto_sorter::{AutoSorterState, SortState, SortSummary, SorterMessage};
+use crate::tabs::duplicate_finder::{
+    DuplicateFinderState, FinderMessage, FinderRequest, ResultGroup, ResultsState, SessionSummary,
+};
+use crate::tabs::settings::{DbAction, DownloadState, SettingsMessage, SettingsState};
 use crate::views::results_viewer;
 use iced::keyboard;
 use iced::widget::{button, column, container, row, text, Rule};
@@ -10,18 +11,23 @@ use shingan_core::detector::archive::ArchiveDetector;
 use shingan_core::detector::Detector;
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{DuplicateScanner, ScanControl, ScanProgress};
+use shingan_core::scanner::grouping::DuplicateGroup;
 use shingan_db::Database;
+use shingan_utils::cleanup::RemoveMode;
+use shingan_utils::settings::AppSettings;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct App {
     active_tab: Tab,
-    theme: AppTheme,
+    settings: AppSettings,
     db: Arc<Database>,
+    /// Shown in the header when the database could not be opened.
+    db_warning: Option<String>,
     finder: DuplicateFinderState,
     sorter: AutoSorterState,
-    settings: SettingsState,
+    settings_tab: SettingsState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,35 +49,121 @@ pub enum Message {
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let db = match Database::open(None) {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("Fatal: failed to open database: {e}");
-                eprintln!("Falling back to in-memory database. Data will not persist.");
+        let settings = shingan_utils::settings::load_settings();
+        let (db, db_warning) = match Database::open(None) {
+            Ok(db) => (db, None),
+            Err(e) => (
                 Database::open(Some(std::path::Path::new(":memory:")))
-                    .expect("in-memory database must succeed")
-            }
+                    .expect("in-memory database must succeed"),
+                Some(format!(
+                    "Could not open the database ({e}); scan history won't be saved this session."
+                )),
+            ),
         };
 
-        (
-            Self {
-                active_tab: Tab::DuplicateFinder,
-                theme: AppTheme::default(),
-                db: Arc::new(db),
-                finder: DuplicateFinderState::default(),
-                sorter: AutoSorterState::default(),
-                settings: SettingsState::default(),
-            },
-            Task::none(),
-        )
+        let mut app = Self {
+            active_tab: Tab::DuplicateFinder,
+            settings_tab: SettingsState::from_settings(&settings),
+            settings,
+            db: Arc::new(db),
+            db_warning,
+            finder: DuplicateFinderState::default(),
+            sorter: AutoSorterState::default(),
+        };
+        app.apply_settings();
+        app.refresh_sessions();
+        (app, Task::none())
     }
 
     pub fn title(&self) -> String {
-        "Shingan — File Deduplicator & Organizer".to_string()
+        "shingan — duplicate finder & file organizer".to_string()
     }
 
     pub fn theme(&self) -> Theme {
-        self.theme.to_iced_theme()
+        if self.settings.dark_theme {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
+    }
+
+    /// Push settings into the tabs that depend on them.
+    fn apply_settings(&mut self) {
+        self.finder.dark = self.settings.dark_theme;
+        self.finder.remove_mode = if self.settings.delete_permanently {
+            RemoveMode::Permanent
+        } else {
+            RemoveMode::Trash
+        };
+        self.sorter.clip_installed = self.settings_tab.clip_installed();
+        self.sorter.cloud_enabled = self.settings.cloud_enabled;
+    }
+
+    fn refresh_sessions(&mut self) {
+        let sessions = self.db.list_scan_sessions().unwrap_or_default();
+        self.finder.recent_sessions = sessions
+            .into_iter()
+            .map(|s| {
+                let (groups, files) = self.db.session_counts(s.id).unwrap_or((0, 0));
+                SessionSummary {
+                    id: s.id,
+                    name: s.name,
+                    created_at: s.created_at,
+                    status: s.status,
+                    groups,
+                    files,
+                }
+            })
+            .collect();
+    }
+
+    fn load_session(&mut self, id: i64) -> Task<FinderMessage> {
+        let Ok(data) = self.db.get_session_files(id) else {
+            self.finder.status_message = Some(format!("Could not load scan #{id}."));
+            return Task::none();
+        };
+        let groups: Vec<ResultGroup> = data
+            .into_iter()
+            .filter_map(|(g, entries)| {
+                let category = FileCategory::from_label(&g.file_type)?;
+                let files: Vec<PathBuf> = entries
+                    .into_iter()
+                    .map(|e| PathBuf::from(e.file_path))
+                    .collect();
+                (files.len() >= 2).then_some(ResultGroup {
+                    category,
+                    group: DuplicateGroup {
+                        files,
+                        similarity: g.similarity_score,
+                    },
+                })
+            })
+            .collect();
+        let mut results = ResultsState::new(Some(id), groups);
+        results.show_results = true;
+        self.finder.current_session_id = Some(id);
+        self.finder.set_results(results)
+    }
+
+    /// Carry out database work requested by the finder tab.
+    fn process_finder_requests(&mut self) -> Task<FinderMessage> {
+        let mut tasks = Vec::new();
+        for req in std::mem::take(&mut self.finder.requests) {
+            match req {
+                FinderRequest::OpenSession(id) => tasks.push(self.load_session(id)),
+                FinderRequest::DeleteSession(id) => {
+                    let _ = self.db.delete_scan_session(id);
+                    self.refresh_sessions();
+                }
+                FinderRequest::FilesRemoved { session_id, paths } => {
+                    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                    let _ = self.db.remove_file_entries(session_id, &refs);
+                    self.refresh_sessions();
+                }
+                FinderRequest::RefreshSessions => self.refresh_sessions(),
+            }
+        }
+        Task::batch(tasks)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -81,139 +173,175 @@ impl App {
                 Task::none()
             }
             Message::ThemeToggled => {
-                self.theme = self.theme.toggle();
+                self.settings.dark_theme = !self.settings.dark_theme;
+                let _ = shingan_utils::settings::save_settings(&self.settings);
+                self.apply_settings();
                 Task::none()
             }
             Message::Finder(msg) => {
-                // Handle StartScan specially to launch the subscription
-                if matches!(msg, FinderMessage::StartScan) {
-                    // Create session in DB
-                    let categories = self.finder.file_types.selected_categories();
-                    let types_json = serde_json::to_string(
-                        &categories.iter().map(|c| c.label()).collect::<Vec<_>>(),
-                    )
-                    .unwrap_or_default();
-                    let threshold = self.finder.threshold as f64 / 100.0;
-
-                    if let Ok(session_id) = self.db.create_scan_session(
-                        &format!("Scan {} paths", self.finder.paths.len()),
-                        &types_json,
-                        threshold,
-                    ) {
-                        self.finder.current_session_id = Some(session_id);
-                        self.db.update_session_status(session_id, "running").ok();
-                    }
-                }
-
-                // Handle DB operations for completed scans
-                if let FinderMessage::ScanProgress(ScanProgress::PhaseCompleted {
-                    ref category,
-                    ref groups,
-                }) = msg
-                {
-                    if let Some(session_id) = self.finder.current_session_id {
-                        self.persist_groups(session_id, *category, groups);
-                    }
-                }
-
-                if let FinderMessage::ScanProgress(ScanProgress::Completed) = msg {
-                    if let Some(session_id) = self.finder.current_session_id {
-                        self.db.update_session_status(session_id, "completed").ok();
-                    }
-                }
-
-                self.finder.update(msg).map(Message::Finder)
-            }
-            Message::KeyPressed(key, modifiers) => {
-                if modifiers.control() {
-                    match key.as_ref() {
-                        keyboard::Key::Character("1") => {
-                            self.active_tab = Tab::DuplicateFinder;
-                        }
-                        keyboard::Key::Character("2") => {
-                            self.active_tab = Tab::AutoSorter;
-                        }
-                        keyboard::Key::Character("3") => {
-                            self.active_tab = Tab::Settings;
-                        }
-                        keyboard::Key::Character("t") => {
-                            self.theme = self.theme.toggle();
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                            if self.active_tab == Tab::DuplicateFinder
-                                && !self.finder.paths.is_empty()
-                                && matches!(
-                                    self.finder.scan_state,
-                                    ScanState::Idle | ScanState::Completed
-                                )
-                            {
-                                return self.update(Message::Finder(FinderMessage::StartScan));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Task::none()
-            }
-            Message::Sorter(msg) => self.sorter.update(msg).map(Message::Sorter),
-            Message::Settings(msg) => {
-                // Handle DB operations from settings
                 match &msg {
-                    SettingsMessage::ClearSessions => {
-                        let count = self.db.clear_sessions().unwrap_or(0);
-                        self.settings.status_message = Some(format!("Cleared {} sessions", count));
-                        return Task::none();
-                    }
-                    SettingsMessage::OptimizeDb => {
-                        match self.db.vacuum() {
-                            Ok(_) => {
-                                self.settings.status_message =
-                                    Some("Database optimized!".to_string())
-                            }
-                            Err(e) => self.settings.status_message = Some(format!("Error: {}", e)),
+                    FinderMessage::StartScan if self.finder.can_start() => {
+                        let categories = self.finder.file_types.selected_categories();
+                        let types_json = serde_json::to_string(
+                            &categories.iter().map(|c| c.label()).collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_default();
+                        let name = self
+                            .finder
+                            .paths
+                            .iter()
+                            .map(|p| {
+                                std::path::Path::new(p)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.clone())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let threshold = self.finder.threshold as f64 / 100.0;
+                        self.finder.current_session_id = self
+                            .db
+                            .create_scan_session(&name, &types_json, threshold)
+                            .ok();
+                        if let Some(id) = self.finder.current_session_id {
+                            self.db.update_session_status(id, "running").ok();
                         }
-                        return Task::none();
+                    }
+                    FinderMessage::ScanProgress(ScanProgress::PhaseCompleted {
+                        category,
+                        groups,
+                    }) => {
+                        if let Some(session_id) = self.finder.current_session_id {
+                            self.persist_groups(session_id, *category, groups);
+                        }
+                    }
+                    FinderMessage::ScanProgress(ScanProgress::Completed)
+                        if self.finder.scan_state.is_active() =>
+                    {
+                        if let Some(id) = self.finder.current_session_id {
+                            self.db.update_session_status(id, "completed").ok();
+                        }
+                    }
+                    FinderMessage::StopScan => {
+                        if let Some(id) = self.finder.current_session_id {
+                            self.db.update_session_status(id, "stopped").ok();
+                        }
                     }
                     _ => {}
                 }
-                self.settings.update(msg).map(Message::Settings)
+                let task = self.finder.update(msg);
+                let extra = self.process_finder_requests();
+                Task::batch([task, extra]).map(Message::Finder)
+            }
+            Message::KeyPressed(key, modifiers) => self.on_key(key, modifiers),
+            Message::Sorter(msg) => self.sorter.update(msg).map(Message::Sorter),
+            Message::Settings(msg) => {
+                let task = self.settings_tab.update(msg, &self.settings);
+                if let Some(saved) = self.settings_tab.saved.take() {
+                    self.settings = saved;
+                }
+                if let Some(action) = self.settings_tab.pending_action.take() {
+                    self.settings_tab.status_message = Some(match action {
+                        DbAction::ClearSessions => match self.db.clear_sessions() {
+                            Ok(n) => format!("Deleted {n} scans from the history."),
+                            Err(e) => format!("Error: {e}"),
+                        },
+                        DbAction::ClearSignatureCache => match self.db.clear_signature_cache() {
+                            Ok(n) => format!("Forgot {n} cached fingerprints."),
+                            Err(e) => format!("Error: {e}"),
+                        },
+                        DbAction::Optimize => match self.db.vacuum() {
+                            Ok(()) => "Database compacted.".to_string(),
+                            Err(e) => format!("Error: {e}"),
+                        },
+                    });
+                    if action == DbAction::ClearSessions {
+                        self.finder.results = None;
+                        self.refresh_sessions();
+                    }
+                }
+                self.apply_settings();
+                task.map(Message::Settings)
             }
         }
     }
 
+    fn on_key(&mut self, key: keyboard::Key, modifiers: keyboard::Modifiers) -> Task<Message> {
+        use keyboard::key::Named;
+        if let keyboard::Key::Named(Named::Escape) = key.as_ref() {
+            if let Some(results) = self.finder.results.as_ref() {
+                let msg = if results.preview.is_some() {
+                    FinderMessage::ClosePreview
+                } else if results.confirm_delete {
+                    FinderMessage::CancelDelete
+                } else if results.show_results {
+                    FinderMessage::CloseResults
+                } else {
+                    return Task::none();
+                };
+                return self.update(Message::Finder(msg));
+            }
+            return Task::none();
+        }
+        if !modifiers.command() {
+            return Task::none();
+        }
+        match key.as_ref() {
+            keyboard::Key::Character("1") => self.active_tab = Tab::DuplicateFinder,
+            keyboard::Key::Character("2") => self.active_tab = Tab::AutoSorter,
+            keyboard::Key::Character("3") => self.active_tab = Tab::Settings,
+            keyboard::Key::Character("t") => return self.update(Message::ThemeToggled),
+            keyboard::Key::Named(Named::Enter)
+                if self.active_tab == Tab::DuplicateFinder && self.finder.can_start() =>
+            {
+                return self.update(Message::Finder(FinderMessage::StartScan));
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
-        // Check if results overlay should be shown
-        if let Some(ref results) = self.finder.results {
-            if results.show_results {
-                return results_viewer::view(
-                    &results.groups,
-                    &results.filter,
-                    &results.selected_for_deletion,
-                    &results.deletion_message,
-                    &results.preview,
-                    results.page,
-                    results.page_size,
-                )
-                .map(Message::Finder);
+        if let Some(results) = &self.finder.results {
+            if results.show_results && self.active_tab == Tab::DuplicateFinder {
+                return results_viewer::view(results, self.finder.remove_mode).map(Message::Finder);
             }
         }
 
-        let header = row![
-            text("shingan").size(24).font(iced::Font::MONOSPACE),
-            text("— File Deduplicator & Organizer").size(16),
+        let mut header = row![
+            text("shingan 心眼").size(24),
+            text("find duplicates · sort files")
+                .size(14)
+                .style(text::secondary),
             iced::widget::horizontal_space(),
-            button(text(self.theme.toggle_label()).size(13))
-                .padding([4, 12])
-                .on_press(Message::ThemeToggled),
+            button(
+                text(if self.settings.dark_theme {
+                    "Light mode"
+                } else {
+                    "Dark mode"
+                })
+                .size(13)
+            )
+            .padding([4, 12])
+            .style(button::secondary)
+            .on_press(Message::ThemeToggled),
         ]
-        .spacing(8)
+        .spacing(10)
         .padding([12, 20])
         .align_y(iced::Alignment::Center);
+        if let Some(w) = &self.db_warning {
+            header = header.push(text(w).size(12).style(text::danger));
+        }
 
         let tab_bar = row![
-            tab_button("Find Duplicates", Tab::DuplicateFinder, self.active_tab),
-            tab_button("Auto-Sort Files", Tab::AutoSorter, self.active_tab),
-            tab_button("Settings", Tab::Settings, self.active_tab),
+            tab_button(
+                "Find duplicates",
+                "Ctrl+1",
+                Tab::DuplicateFinder,
+                self.active_tab
+            ),
+            tab_button("Auto-sort", "Ctrl+2", Tab::AutoSorter, self.active_tab),
+            tab_button("Settings", "Ctrl+3", Tab::Settings, self.active_tab),
         ]
         .spacing(4)
         .padding([0, 20]);
@@ -221,77 +349,67 @@ impl App {
         let tab_content: Element<Message> = match self.active_tab {
             Tab::DuplicateFinder => self.finder.view().map(Message::Finder),
             Tab::AutoSorter => self.sorter.view().map(Message::Sorter),
-            Tab::Settings => self.settings.view().map(Message::Settings),
+            Tab::Settings => self.settings_tab.view().map(Message::Settings),
         };
 
-        let content = column![
-            header,
-            Rule::horizontal(1),
-            tab_bar,
-            Rule::horizontal(1),
-            tab_content,
-        ]
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-        container(content)
+        container(
+            column![
+                header,
+                Rule::horizontal(1),
+                tab_bar,
+                Rule::horizontal(1),
+                tab_content
+            ]
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = Vec::new();
 
-        // Scanner subscription
-        if let ScanState::Running { .. } = &self.finder.scan_state {
-            if let Some(ref control) = self.finder.scan_control {
-                let paths: Vec<(PathBuf, bool)> = self
-                    .finder
-                    .paths
-                    .iter()
-                    .map(|p| (PathBuf::from(p), self.finder.include_subdirs))
-                    .collect();
-                let categories = self.finder.file_types.selected_categories();
-                let threshold = self.finder.threshold as f64 / 100.0;
-                let control = control.clone();
-                let settings = crate::tabs::settings::load_settings();
-                let video_skip = settings.video_skip_secs;
-                let video_duration = settings.video_duration_secs;
-
+        // Scanner: stays subscribed while paused so pausing never restarts the scan.
+        if self.finder.scan_state.is_active() {
+            if let Some(control) = &self.finder.scan_control {
+                let job = ScanJob {
+                    paths: self
+                        .finder
+                        .paths
+                        .iter()
+                        .map(|p| (PathBuf::from(p), self.finder.include_subdirs))
+                        .collect(),
+                    categories: self.finder.file_types.selected_categories(),
+                    threshold: self.finder.threshold as f64 / 100.0,
+                    control: control.clone(),
+                    db: self.db.clone(),
+                    settings: self.settings.clone(),
+                };
                 subs.push(
                     Subscription::run_with_id(
-                        "scanner",
-                        scan_subscription(
-                            paths,
-                            categories,
-                            threshold,
-                            control,
-                            self.db.clone(),
-                            video_skip,
-                            video_duration,
-                        ),
+                        ("scanner", self.finder.scan_generation),
+                        scan_subscription(job),
                     )
-                    .map(|progress| Message::Finder(FinderMessage::ScanProgress(progress))),
+                    .map(|p| Message::Finder(FinderMessage::ScanProgress(p))),
                 );
             }
         }
 
-        // Model download subscription
-        if let DownloadState::Downloading { ref model_id, .. } = self.settings.download {
+        if let DownloadState::Downloading { ref model_id, .. } = self.settings_tab.download {
             if let Some(model) = shingan_ml::model_registry::find_model(model_id) {
                 let files: Vec<(String, String)> = model
                     .files
                     .iter()
                     .map(|f| (f.filename.to_string(), f.url.to_string()))
                     .collect();
-                let target_dir =
-                    shingan_ml::model_registry::resolve_models_dir(&self.settings.ml_model_path);
-
+                let target_dir = shingan_ml::model_registry::resolve_models_dir(
+                    &self.settings_tab.ml_model_path,
+                );
                 subs.push(
                     Subscription::run_with_id(
-                        "model-download",
+                        ("model-download", self.settings_tab.download_generation),
                         download_subscription(files, target_dir),
                     )
                     .map(Message::Settings),
@@ -299,203 +417,183 @@ impl App {
             }
         }
 
-        // Sorter subscription
-        if let crate::tabs::auto_sorter::SortState::Running { .. } = &self.sorter.sort_state {
-            let sources: Vec<PathBuf> =
-                self.sorter.source_paths.iter().map(PathBuf::from).collect();
-            let dest = PathBuf::from(&self.sorter.destination);
-            let use_ml = self.sorter.use_ml;
-
-            let settings = crate::tabs::settings::load_settings();
-            let pipeline_config = shingan_ml::PipelineConfig {
-                tier0_min_confidence: settings.classification_confidence_threshold,
-                model_dir: settings.ml_model_path.map(PathBuf::from),
-                ..shingan_ml::PipelineConfig::default()
+        if let SortState::Running { .. } = &self.sorter.sort_state {
+            let job = SortJob {
+                sources: self.sorter.source_paths.iter().map(PathBuf::from).collect(),
+                destination: PathBuf::from(self.sorter.destination.trim()),
+                use_ml: self.sorter.use_ml,
+                dry_run: self.sorter.dry_run,
+                include_unknown: !self.sorter.skip_unknown,
+                cancel: self.sorter.cancel.clone(),
+                settings: self.settings.clone(),
             };
-
             subs.push(
                 Subscription::run_with_id(
-                    "sorter",
-                    sort_subscription(sources, dest, use_ml, pipeline_config),
+                    ("sorter", self.sorter.run_generation),
+                    sort_subscription(job),
                 )
                 .map(Message::Sorter),
             );
         }
 
-        // Keyboard shortcuts
         subs.push(keyboard::on_key_press(|key, modifiers| {
-            if modifiers.control() {
-                Some(Message::KeyPressed(key, modifiers))
-            } else {
-                None
-            }
+            let escape = matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape));
+            (modifiers.command() || escape).then_some(Message::KeyPressed(key, modifiers))
         }));
 
         Subscription::batch(subs)
     }
 
-    fn persist_groups(
-        &self,
-        session_id: i64,
-        category: FileCategory,
-        groups: &[shingan_core::scanner::grouping::DuplicateGroup],
-    ) {
+    fn persist_groups(&self, session_id: i64, category: FileCategory, groups: &[DuplicateGroup]) {
         struct OwnedEntry {
             file_path: String,
             file_size: i64,
+            modified: Option<String>,
         }
-        struct OwnedGroup {
-            entries: Vec<OwnedEntry>,
-            similarity: f64,
-        }
-
-        let owned: Vec<OwnedGroup> = groups
+        let owned: Vec<(f64, Vec<OwnedEntry>)> = groups
             .iter()
             .map(|group| {
-                let entries: Vec<OwnedEntry> = group
+                let entries = group
                     .files
                     .iter()
                     .map(|file_path| {
                         let meta = std::fs::metadata(file_path).ok();
-                        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
                         OwnedEntry {
                             file_path: file_path.to_string_lossy().into_owned(),
-                            file_size: size,
+                            file_size: meta.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                            modified: meta
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs().to_string()),
                         }
                     })
                     .collect();
-                OwnedGroup {
-                    entries,
-                    similarity: group.similarity,
-                }
+                (group.similarity, entries)
             })
             .collect();
 
-        let batch_refs: Vec<(
-            &str,
-            f64,
-            Option<&str>,
-            Vec<shingan_db::models::NewFileEntryBatch>,
-        )> = owned
+        let batches: Vec<(f64, Vec<shingan_db::models::NewFileEntryBatch>)> = owned
             .iter()
-            .map(|group| {
-                let entries: Vec<shingan_db::models::NewFileEntryBatch> = group
-                    .entries
-                    .iter()
-                    .map(|e| shingan_db::models::NewFileEntryBatch {
-                        file_path: &e.file_path,
-                        file_size: e.file_size,
-                        modified_time: None,
-                        thumbnail_path: None,
-                        file_metadata: None,
-                    })
-                    .collect();
+            .map(|(sim, entries)| {
                 (
-                    category.label(),
-                    group.similarity,
-                    None as Option<&str>,
-                    entries,
+                    *sim,
+                    entries
+                        .iter()
+                        .map(|e| shingan_db::models::NewFileEntryBatch {
+                            file_path: &e.file_path,
+                            file_size: e.file_size,
+                            modified_time: e.modified.as_deref(),
+                            thumbnail_path: None,
+                            file_metadata: None,
+                        })
+                        .collect(),
                 )
             })
             .collect();
-
-        let batch_slices: Vec<(
+        let slices: Vec<(
             &str,
             f64,
             Option<&str>,
             &[shingan_db::models::NewFileEntryBatch],
-        )> = batch_refs
+        )> = batches
             .iter()
-            .map(|(ft, sim, hv, entries)| (*ft, *sim, hv.as_deref(), entries.as_slice()))
+            .map(|(sim, e)| (category.label(), *sim, None, e.as_slice()))
             .collect();
 
-        if let Err(e) = self
-            .db
-            .insert_duplicate_groups_batch(session_id, &batch_slices)
-        {
+        if let Err(e) = self.db.insert_duplicate_groups_batch(session_id, &slices) {
             eprintln!("Failed to persist duplicate groups: {e}");
         }
     }
 }
 
-fn tab_button(label: &str, tab: Tab, active: Tab) -> Element<'_, Message> {
-    let btn = button(text(label).size(14)).padding([8, 20]);
+fn tab_button<'a>(
+    label: &'a str,
+    shortcut: &'a str,
+    tab: Tab,
+    active: Tab,
+) -> Element<'a, Message> {
+    let content = column![
+        text(label).size(14),
+        text(shortcut).size(10).style(text::secondary)
+    ]
+    .align_x(iced::Alignment::Center);
+    let btn = button(content).padding([6, 20]);
     if tab == active {
-        btn.into()
+        btn.style(button::primary).into()
     } else {
-        btn.on_press(Message::TabSelected(tab)).into()
+        btn.style(button::secondary)
+            .on_press(Message::TabSelected(tab))
+            .into()
     }
 }
 
-/// Create a stream of ScanProgress messages from a background scanner.
-fn scan_subscription(
+/// Everything a scan needs, captured when it starts.
+struct ScanJob {
     paths: Vec<(PathBuf, bool)>,
     categories: Vec<FileCategory>,
     threshold: f64,
     control: Arc<ScanControl>,
     db: Arc<Database>,
-    video_skip_secs: f64,
-    video_duration_secs: f64,
-) -> impl futures::Stream<Item = ScanProgress> {
+    settings: AppSettings,
+}
+
+fn build_detectors(job: &ScanJob) -> HashMap<FileCategory, Box<dyn Detector>> {
+    use shingan_core::detector::{code, document, image, video};
+    let t = job.threshold;
+    job.categories
+        .iter()
+        .map(|cat| {
+            let d: Box<dyn Detector> = match cat {
+                FileCategory::Archive => Box::new(ArchiveDetector::new(t)),
+                FileCategory::Image => Box::new(image::ImageDetector::new(t, 12)),
+                FileCategory::Code => Box::new(code::CodeDetector::new(t)),
+                FileCategory::Document => Box::new(document::DocumentDetector::new(t)),
+                FileCategory::Video => Box::new(video::VideoDetector::with_sampling(
+                    t,
+                    job.settings.video_skip_secs,
+                    job.settings.video_duration_secs,
+                )),
+            };
+            (*cat, d)
+        })
+        .collect()
+}
+
+/// Run the scanner on a blocking thread and stream its progress.
+fn scan_subscription(job: ScanJob) -> impl futures::Stream<Item = ScanProgress> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
 
         let (progress_tx, progress_rx) = crossbeam_channel::unbounded();
+        let scanner = DuplicateScanner::new(
+            &job.categories,
+            build_detectors(&job),
+            job.threshold,
+            job.control.clone(),
+            progress_tx,
+        )
+        .with_signature_cache(Box::new(job.db.clone()))
+        .with_size_limits(job.settings.min_file_size_kb * 1024, None)
+        .with_threads(job.settings.thread_count as usize);
 
-        // Build detectors
-        let mut detectors: HashMap<FileCategory, Box<dyn Detector>> = HashMap::new();
-        for cat in &categories {
-            let detector: Option<Box<dyn Detector>> = match cat {
-                FileCategory::Archive => Some(Box::new(ArchiveDetector::new(threshold))),
-                FileCategory::Image => Some(Box::new(
-                    shingan_core::detector::image::ImageDetector::new(threshold, 12),
-                )),
-                FileCategory::Code => Some(Box::new(
-                    shingan_core::detector::code::CodeDetector::new(threshold),
-                )),
-                FileCategory::Document => Some(Box::new(
-                    shingan_core::detector::document::DocumentDetector::new(threshold),
-                )),
-                FileCategory::Video => Some(Box::new(
-                    shingan_core::detector::video::VideoDetector::with_sampling(
-                        threshold,
-                        video_skip_secs,
-                        video_duration_secs,
-                    ),
-                )),
-            };
-            if let Some(d) = detector {
-                detectors.insert(*cat, d);
-            }
-        }
-
-        // Pre-load cached signatures from DB for all scan paths
-        let cached_signatures = load_cached_signatures(&db, &paths, &categories);
-
-        let scanner =
-            DuplicateScanner::new(&categories, detectors, threshold, control, progress_tx)
-                .with_cached_signatures(cached_signatures);
-
-        // Run scanner on blocking thread, collecting new signatures to persist
-        let paths_clone = paths.clone();
-        let db_clone = db.clone();
+        let db = job.db.clone();
+        let paths = job.paths.clone();
         tokio::task::spawn_blocking(move || {
-            let (_results, new_sigs) = scanner.scan_paths(&paths_clone);
-            // Persist newly computed signatures for future rescans
+            let (_results, new_sigs) = scanner.scan_paths(&paths);
             if !new_sigs.is_empty() {
-                persist_new_signatures(&db_clone, &new_sigs, &paths_clone, &categories);
+                if let Err(e) = db.cache_new_signatures(&new_sigs) {
+                    eprintln!("Failed to cache signatures: {e}");
+                }
             }
         });
 
-        // Forward progress messages to the iced stream.
-        // Use try_recv + async sleep so we don't block the tokio runtime
-        // (blocking recv() prevents iced from processing intermediate updates).
+        // Poll without blocking the async runtime so iced keeps redrawing.
         loop {
             match progress_rx.try_recv() {
                 Ok(msg) => {
-                    let is_completed = matches!(msg, ScanProgress::Completed);
+                    let done = matches!(msg, ScanProgress::Completed);
                     let _ = output.send(msg).await;
-                    if is_completed {
+                    if done {
                         break;
                     }
                 }
@@ -508,314 +606,164 @@ fn scan_subscription(
                 }
             }
         }
+        // Keep the stream alive (idle) so the subscription doesn't restart.
+        futures::future::pending::<()>().await;
     })
 }
 
-/// Create a stream of SorterMessages from a background auto-sorter.
-/// Walk scan paths and query DB for cached signatures of files that haven't changed.
-fn load_cached_signatures(
-    db: &Database,
-    paths: &[(PathBuf, bool)],
-    categories: &[FileCategory],
-) -> HashMap<String, String> {
-    use shingan_core::file_info::ExtensionMap;
-    use std::collections::HashSet;
-
-    let ext_map = ExtensionMap::new();
-    let cat_set: HashSet<FileCategory> = categories.iter().copied().collect();
-    let mut queries: Vec<(String, i64, i64, String)> = Vec::new();
-
-    for (path, include_subdirs) in paths {
-        let walker = if *include_subdirs {
-            walkdir::WalkDir::new(path).follow_links(false).into_iter()
-        } else {
-            walkdir::WalkDir::new(path)
-                .max_depth(1)
-                .follow_links(false)
-                .into_iter()
-        };
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let fpath = entry.path();
-            let ext = match fpath.extension().and_then(|e| e.to_str()) {
-                Some(e) => e.to_lowercase(),
-                None => continue,
-            };
-            let cat = match ext_map.get(&ext) {
-                Some(c) if cat_set.contains(&c) => c,
-                _ => continue,
-            };
-            if let Ok(meta) = std::fs::metadata(fpath) {
-                let size = meta.len() as i64;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                queries.push((
-                    fpath.to_string_lossy().into_owned(),
-                    size,
-                    mtime,
-                    cat.label().to_string(),
-                ));
-            }
-        }
-    }
-
-    if queries.is_empty() {
-        return HashMap::new();
-    }
-
-    // Query DB in batches to avoid overly long single queries
-    let query_refs: Vec<(&str, i64, i64, &str)> = queries
-        .iter()
-        .map(|(p, s, m, c)| (p.as_str(), *s, *m, c.as_str()))
-        .collect();
-
-    db.get_cached_signatures(&query_refs).unwrap_or_default()
-}
-
-/// Persist newly computed signatures to the DB for future rescans.
-fn persist_new_signatures(
-    db: &Database,
-    new_sigs: &[(String, String)],
-    paths: &[(PathBuf, bool)],
-    _categories: &[FileCategory],
-) {
-    // Build a lookup of path -> (size, mtime, category) from discovered files
-    let mut file_meta: HashMap<String, (i64, i64, String)> = HashMap::new();
-
-    // We need file metadata for each signature. Walk the paths to get it.
-    for (path, include_subdirs) in paths {
-        let walker = if *include_subdirs {
-            walkdir::WalkDir::new(path).follow_links(false).into_iter()
-        } else {
-            walkdir::WalkDir::new(path)
-                .max_depth(1)
-                .follow_links(false)
-                .into_iter()
-        };
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let fpath = entry.path();
-            if let Ok(meta) = std::fs::metadata(fpath) {
-                let ext = fpath
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let ext_map = shingan_core::file_info::ExtensionMap::new();
-                let cat = match ext_map.get(&ext) {
-                    Some(c) => c.label().to_string(),
-                    None => continue,
-                };
-                let size = meta.len() as i64;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                file_meta.insert(fpath.to_string_lossy().into_owned(), (size, mtime, cat));
-            }
-        }
-    }
-
-    let entries: Vec<(&str, i64, i64, &str, &str)> = new_sigs
-        .iter()
-        .filter_map(|(path, sig)| {
-            file_meta.get(path).map(|(size, mtime, cat)| {
-                (path.as_str(), *size, *mtime, cat.as_str(), sig.as_str())
-            })
-        })
-        .collect();
-
-    if !entries.is_empty() {
-        if let Err(e) = db.cache_signatures_batch(&entries) {
-            eprintln!("Failed to cache signatures: {e}");
-        }
-    }
-}
-
-/// Download model files with progress reporting.
+/// Download model files to `<name>.part`, renaming only when complete.
 fn download_subscription(
-    files: Vec<(String, String)>, // (filename, url)
+    files: Vec<(String, String)>,
     target_dir: PathBuf,
 ) -> impl futures::Stream<Item = SettingsMessage> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
 
-        if let Err(e) = std::fs::create_dir_all(&target_dir) {
-            let _ = output
-                .send(SettingsMessage::DownloadComplete(Err(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))))
-                .await;
-            return;
-        }
+        let result: Result<(), String> = async {
+            std::fs::create_dir_all(&target_dir)
+                .map_err(|e| format!("Failed to create {}: {e}", target_dir.display()))?;
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let file_count = files.len();
 
-        let client = reqwest::Client::new();
-        let file_count = files.len();
-
-        for (file_index, (filename, url)) in files.iter().enumerate() {
-            if url.is_empty() {
-                let _ = output
-                    .send(SettingsMessage::DownloadComplete(Err(format!(
-                        "No download URL configured for {}",
-                        filename
-                    ))))
-                    .await;
-                return;
-            }
-
-            // Send initial progress for this file.
-            let _ = output
-                .send(SettingsMessage::DownloadProgress {
-                    current_file: filename.clone(),
-                    file_index,
-                    file_count,
-                    downloaded: 0,
-                    total: 0,
-                })
-                .await;
-
-            let response = match client.get(url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = output
-                        .send(SettingsMessage::DownloadComplete(Err(format!(
-                            "Failed to download {}: {}",
-                            filename, e
-                        ))))
-                        .await;
-                    return;
+            for (file_index, (filename, url)) in files.iter().enumerate() {
+                if url.is_empty() {
+                    return Err(format!("No download URL configured for {filename}"));
                 }
-            };
-
-            if !response.status().is_success() {
-                let _ = output
-                    .send(SettingsMessage::DownloadComplete(Err(format!(
-                        "{}: HTTP {}",
-                        filename,
-                        response.status()
-                    ))))
-                    .await;
-                return;
-            }
-
-            let total = response.content_length().unwrap_or(0);
-            let target_path = target_dir.join(filename);
-
-            let mut file = match std::fs::File::create(&target_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = output
-                        .send(SettingsMessage::DownloadComplete(Err(format!(
-                            "Failed to create {}: {}",
-                            filename, e
-                        ))))
-                        .await;
-                    return;
+                let mut response = client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to download {filename}: {e}"))?;
+                if !response.status().is_success() {
+                    return Err(format!("{filename}: HTTP {}", response.status()));
                 }
-            };
+                let total = response.content_length().unwrap_or(0);
+                let target = target_dir.join(filename);
+                let part = shingan_ml::model_registry::partial_path(&target);
+                let mut file = std::fs::File::create(&part)
+                    .map_err(|e| format!("Failed to create {}: {e}", part.display()))?;
 
-            let mut downloaded: u64 = 0;
-            let mut last_update = std::time::Instant::now();
-            let mut response = response;
-
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        use std::io::Write;
-                        if let Err(e) = file.write_all(&chunk) {
-                            let _ = output
-                                .send(SettingsMessage::DownloadComplete(Err(format!(
-                                    "Write error for {}: {}",
-                                    filename, e
-                                ))))
-                                .await;
-                            return;
-                        }
-                        downloaded += chunk.len() as u64;
-
-                        // Throttle progress updates to avoid flooding the UI.
-                        if last_update.elapsed() >= std::time::Duration::from_millis(150)
-                            || downloaded == total
-                        {
-                            let _ = output
-                                .send(SettingsMessage::DownloadProgress {
-                                    current_file: filename.clone(),
-                                    file_index,
-                                    file_count,
-                                    downloaded,
-                                    total,
-                                })
-                                .await;
-                            last_update = std::time::Instant::now();
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
+                let mut downloaded: u64 = 0;
+                let mut last_update = std::time::Instant::now();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|e| format!("Download error for {filename}: {e}"))?
+                {
+                    use std::io::Write;
+                    file.write_all(&chunk)
+                        .map_err(|e| format!("Write error for {filename}: {e}"))?;
+                    downloaded += chunk.len() as u64;
+                    if last_update.elapsed() >= std::time::Duration::from_millis(150) {
                         let _ = output
-                            .send(SettingsMessage::DownloadComplete(Err(format!(
-                                "Download error for {}: {}",
-                                filename, e
-                            ))))
+                            .send(SettingsMessage::DownloadProgress {
+                                current_file: filename.clone(),
+                                file_index,
+                                file_count,
+                                downloaded,
+                                total,
+                            })
                             .await;
-                        return;
+                        last_update = std::time::Instant::now();
                     }
                 }
+                drop(file);
+                if total > 0 && downloaded != total {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!(
+                        "{filename}: incomplete download ({downloaded} of {total} bytes)"
+                    ));
+                }
+                std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
             }
+            Ok(())
         }
+        .await;
 
-        let _ = output.send(SettingsMessage::DownloadComplete(Ok(()))).await;
+        let _ = output.send(SettingsMessage::DownloadComplete(result)).await;
+        futures::future::pending::<()>().await;
     })
 }
 
-fn sort_subscription(
+struct SortJob {
     sources: Vec<PathBuf>,
     destination: PathBuf,
     use_ml: bool,
-    pipeline_config: shingan_ml::PipelineConfig,
-) -> impl futures::Stream<Item = SorterMessage> {
+    dry_run: bool,
+    include_unknown: bool,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    settings: AppSettings,
+}
+
+fn sort_subscription(job: SortJob) -> impl futures::Stream<Item = SorterMessage> {
     iced::stream::channel(100, move |mut output| async move {
         use futures::SinkExt;
 
-        let (progress_tx, progress_rx) = crossbeam_channel::unbounded::<SorterMessage>();
-
-        let tx = progress_tx.clone();
+        let (tx, rx) = crossbeam_channel::unbounded::<SorterMessage>();
         tokio::task::spawn_blocking(move || {
-            let sorter = shingan_utils::auto_sorter::AutoSorter::new(sources, destination)
-                .with_ml(use_ml)
-                .with_pipeline_config(pipeline_config);
+            let mut notes = Vec::new();
+            let cloud = if job.use_ml {
+                match job.settings.cloud_categorizer() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        notes.push(format!("Cloud classification disabled: {e}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut sorter =
+                shingan_utils::auto_sorter::AutoSorter::new(job.sources, job.destination)
+                    .with_ml(job.use_ml)
+                    .with_dry_run(job.dry_run)
+                    .with_include_unknown(job.include_unknown)
+                    .with_pipeline_config(job.settings.pipeline_config())
+                    .with_cloud(cloud);
+            if let Some(c) = job.cancel {
+                sorter = sorter.with_cancel_flag(c);
+            }
+            let collected = std::sync::Mutex::new(Vec::<String>::new());
+            let progress_tx = tx.clone();
             let stats = sorter.sort_files(
-                Some(&|current, total, filepath| {
-                    let _ = tx.send(SorterMessage::SortProgress {
+                Some(&|current, total, file| {
+                    let _ = progress_tx.send(SorterMessage::SortProgress {
                         current,
                         total,
-                        file: filepath.to_string(),
+                        file: file.to_string(),
                     });
                 }),
-                None,
+                Some(&|msg| {
+                    // Per-file dry-run lines are shown from `moves` instead.
+                    if !msg.starts_with("  ") && !msg.starts_with("Sorting ") {
+                        collected.lock().unwrap().push(msg.to_string());
+                    }
+                }),
             );
-            let _ = tx.send(SorterMessage::SortCompleted {
+            notes.extend(collected.into_inner().unwrap_or_default());
+            let _ = tx.send(SorterMessage::SortCompleted(Box::new(SortSummary {
+                dry_run: job.dry_run,
                 moved: stats.moved,
                 failed: stats.failed,
-            });
+                skipped: stats.skipped,
+                cancelled: stats.cancelled,
+                moves: stats.moves,
+                errors: stats.errors,
+                notes,
+                journal: stats.journal,
+                undo_message: None,
+            })));
         });
 
         loop {
-            match progress_rx.try_recv() {
+            match rx.try_recv() {
                 Ok(msg) => {
-                    let is_done = matches!(msg, SorterMessage::SortCompleted { .. });
+                    let done = matches!(msg, SorterMessage::SortCompleted(_));
                     let _ = output.send(msg).await;
-                    if is_done {
+                    if done {
                         break;
                     }
                 }
@@ -825,5 +773,6 @@ fn sort_subscription(
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
+        futures::future::pending::<()>().await;
     })
 }

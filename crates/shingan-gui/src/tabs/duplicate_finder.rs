@@ -1,3 +1,5 @@
+use crate::media::{self, PreviewData};
+use crate::platform::{format_size, truncate_end};
 use iced::widget::{
     button, checkbox, column, container, progress_bar, row, scrollable, slider, text, Rule,
 };
@@ -5,8 +7,21 @@ use iced::{Element, Length, Task};
 use shingan_core::file_info::FileCategory;
 use shingan_core::scanner::duplicate::{ScanControl, ScanProgress};
 use shingan_core::scanner::grouping::DuplicateGroup;
-use std::collections::HashMap;
+use shingan_utils::cleanup::{self, KeepStrategy, RemoveMode, RemoveReport};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// A past scan shown in the "Recent scans" list.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub status: String,
+    pub groups: u64,
+    pub files: u64,
+}
 
 /// State for the Duplicate Finder tab.
 pub struct DuplicateFinderState {
@@ -19,6 +34,27 @@ pub struct DuplicateFinderState {
     pub results: Option<ResultsState>,
     pub scan_control: Option<Arc<ScanControl>>,
     pub status_message: Option<String>,
+    /// Bumped for every new scan so its subscription gets a fresh identity.
+    pub scan_generation: u64,
+    pub recent_sessions: Vec<SessionSummary>,
+    /// Set by the app from settings.
+    pub dark: bool,
+    pub remove_mode: RemoveMode,
+    /// Requests the app must carry out (database access).
+    pub requests: Vec<FinderRequest>,
+}
+
+/// Work the finder asks the app to do, since the app owns the database.
+#[derive(Debug, Clone)]
+pub enum FinderRequest {
+    OpenSession(i64),
+    DeleteSession(i64),
+    /// Files were removed from disk; drop them from the stored session.
+    FilesRemoved {
+        session_id: i64,
+        paths: Vec<String>,
+    },
+    RefreshSessions,
 }
 
 #[derive(Debug, Clone)]
@@ -77,21 +113,103 @@ pub enum ScanState {
         progress: f32,
         status: String,
         elapsed_secs: f64,
-        eta_secs: Option<f64>,
     },
     Completed,
 }
 
+impl ScanState {
+    /// Running or paused: the scanner thread is alive.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Paused { .. })
+    }
+}
+
+/// One duplicate group as shown in the results list.
+#[derive(Debug, Clone)]
+pub struct ResultGroup {
+    pub category: FileCategory,
+    pub group: DuplicateGroup,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResultsState {
-    pub groups: HashMap<FileCategory, Vec<DuplicateGroup>>,
-    pub selected_for_deletion: std::collections::HashSet<String>,
+    pub session_id: Option<i64>,
+    pub groups: Vec<ResultGroup>,
+    pub selected_for_deletion: HashSet<PathBuf>,
     pub filter: Option<FileCategory>,
     pub show_results: bool,
-    pub deletion_message: Option<String>,
+    pub message: Option<String>,
+    pub confirm_delete: bool,
+    pub deleting: bool,
     pub preview: Option<PreviewFile>,
     pub page: usize,
     pub page_size: usize,
+    /// file -> cached thumbnail
+    pub thumbnails: HashMap<PathBuf, PathBuf>,
+    /// Files whose thumbnail was already requested (successful or not).
+    pub thumbs_requested: HashSet<PathBuf>,
+}
+
+impl ResultsState {
+    pub fn new(session_id: Option<i64>, groups: Vec<ResultGroup>) -> Self {
+        Self {
+            session_id,
+            groups,
+            selected_for_deletion: HashSet::new(),
+            filter: None,
+            show_results: false,
+            message: None,
+            confirm_delete: false,
+            deleting: false,
+            preview: None,
+            page: 0,
+            page_size: 30,
+            thumbnails: HashMap::new(),
+            thumbs_requested: HashSet::new(),
+        }
+    }
+
+    /// Indices (into `groups`) of the groups matching the current filter.
+    pub fn visible(&self) -> Vec<usize> {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| self.filter.is_none_or(|f| g.category == f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn last_page(&self) -> usize {
+        self.visible()
+            .len()
+            .saturating_sub(1)
+            .checked_div(self.page_size)
+            .unwrap_or(0)
+    }
+
+    pub fn page_indices(&self) -> Vec<usize> {
+        let page = self.page.min(self.last_page());
+        self.visible()
+            .into_iter()
+            .skip(page * self.page_size)
+            .take(self.page_size)
+            .collect()
+    }
+
+    /// Total size of the selected files that still exist.
+    pub fn selected_bytes(&self) -> u64 {
+        self.selected_for_deletion
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        let groups = self.groups.len();
+        let files = self.groups.iter().map(|g| g.group.files.len()).sum();
+        (groups, files)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,8 +219,7 @@ pub struct PreviewFile {
     pub zoom: f32,
     /// For PDFs: which page is rendered (0-indexed).
     pub pdf_page: usize,
-    /// Path to a rendered temp image (for PDF pages, video frames).
-    pub rendered_image: Option<String>,
+    pub data: Option<PreviewData>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,15 +237,20 @@ pub enum FinderMessage {
     ScanProgress(ScanProgress),
     ViewResults,
     CloseResults,
+    OpenSession(i64),
+    DeleteSession(i64),
     FilterChanged(Option<FileCategory>),
-    ToggleFileForDeletion(String),
-    SelectAll,
+    ToggleFileForDeletion(PathBuf),
     SelectNone,
-    KeepNewest,
-    KeepLargest,
+    ApplyKeep(KeepStrategy),
     DeleteSelected,
+    ConfirmDelete,
+    CancelDelete,
+    DeleteFinished(Arc<RemoveReport>, usize),
     ExportResults,
+    Exported(Result<Option<String>, String>),
     PreviewFile(String, FileCategory),
+    PreviewReady(Box<PreviewData>),
     ClosePreview,
     OpenInExplorer(String),
     OpenWithSystem(String),
@@ -141,6 +263,7 @@ pub enum FinderMessage {
     PagePrev,
     PageFirst,
     PageLast,
+    ThumbnailsReady(Vec<(PathBuf, Option<PathBuf>)>),
 }
 
 impl Default for DuplicateFinderState {
@@ -155,19 +278,92 @@ impl Default for DuplicateFinderState {
             results: None,
             scan_control: None,
             status_message: None,
+            scan_generation: 0,
+            recent_sessions: Vec::new(),
+            dark: true,
+            remove_mode: RemoveMode::Trash,
+            requests: Vec::new(),
         }
     }
 }
 
+fn preview_task(
+    path: String,
+    category: FileCategory,
+    page: usize,
+    dark: bool,
+) -> Task<FinderMessage> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || media::load_preview(&path, category, page, dark))
+                .await
+                .unwrap_or_default()
+        },
+        |d| FinderMessage::PreviewReady(Box::new(d)),
+    )
+}
+
 impl DuplicateFinderState {
+    pub fn can_start(&self) -> bool {
+        !self.paths.is_empty()
+            && !self.file_types.selected_categories().is_empty()
+            && !self.scan_state.is_active()
+    }
+
+    /// Install freshly loaded/scanned results and start making thumbnails.
+    pub fn set_results(&mut self, results: ResultsState) -> Task<FinderMessage> {
+        self.results = Some(results);
+        self.thumbnail_task()
+    }
+
+    /// Generate thumbnails for the files on the current results page.
+    fn thumbnail_task(&mut self) -> Task<FinderMessage> {
+        let Some(results) = &mut self.results else {
+            return Task::none();
+        };
+        let mut wanted: Vec<(PathBuf, FileCategory)> = Vec::new();
+        for i in results.page_indices() {
+            let g = &results.groups[i];
+            if !matches!(g.category, FileCategory::Image | FileCategory::Video) {
+                continue;
+            }
+            for f in &g.group.files {
+                if results.thumbs_requested.insert(f.clone()) {
+                    wanted.push((f.clone(), g.category));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    wanted
+                        .into_par_iter()
+                        .map(|(p, c)| {
+                            let t = media::thumbnail(&p, c);
+                            (p, t)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default()
+            },
+            FinderMessage::ThumbnailsReady,
+        )
+    }
+
     pub fn update(&mut self, message: FinderMessage) -> Task<FinderMessage> {
         match message {
             FinderMessage::AddFolder => {
-                // Use rfd for folder selection (blocking for now)
                 return Task::perform(
                     async {
-                        let handle = rfd::AsyncFileDialog::new().pick_folder().await;
-                        handle.map(|h| h.path().to_string_lossy().to_string())
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_string_lossy().to_string())
                     },
                     FinderMessage::FolderSelected,
                 );
@@ -183,9 +379,7 @@ impl DuplicateFinderState {
                     self.paths.remove(idx);
                 }
             }
-            FinderMessage::ToggleSubdirs(val) => {
-                self.include_subdirs = val;
-            }
+            FinderMessage::ToggleSubdirs(val) => self.include_subdirs = val,
             FinderMessage::ToggleFileType(cat, enabled) => match cat {
                 FileCategory::Image => self.file_types.image = enabled,
                 FileCategory::Document => self.file_types.document = enabled,
@@ -193,10 +387,12 @@ impl DuplicateFinderState {
                 FileCategory::Archive => self.file_types.archive = enabled,
                 FileCategory::Code => self.file_types.code = enabled,
             },
-            FinderMessage::ThresholdChanged(val) => {
-                self.threshold = val.clamp(80, 100);
-            }
+            FinderMessage::ThresholdChanged(val) => self.threshold = val.clamp(70, 100),
             FinderMessage::StartScan => {
+                if !self.can_start() {
+                    return Task::none();
+                }
+                self.scan_generation += 1;
                 self.scan_state = ScanState::Running {
                     progress: 0.0,
                     status: "Starting scan...".to_string(),
@@ -205,8 +401,7 @@ impl DuplicateFinderState {
                 };
                 self.results = None;
                 self.status_message = None;
-                let control = Arc::new(ScanControl::new());
-                self.scan_control = Some(control);
+                self.scan_control = Some(Arc::new(ScanControl::new()));
             }
             FinderMessage::PauseScan => {
                 if let Some(control) = &self.scan_control {
@@ -214,15 +409,15 @@ impl DuplicateFinderState {
                 }
                 if let ScanState::Running {
                     progress,
+                    status,
                     elapsed_secs,
                     ..
                 } = &self.scan_state
                 {
                     self.scan_state = ScanState::Paused {
                         progress: *progress,
-                        status: "Paused".to_string(),
+                        status: status.clone(),
                         elapsed_secs: *elapsed_secs,
-                        eta_secs: None,
                     };
                 }
             }
@@ -232,13 +427,13 @@ impl DuplicateFinderState {
                 }
                 if let ScanState::Paused {
                     progress,
+                    status,
                     elapsed_secs,
-                    ..
                 } = &self.scan_state
                 {
                     self.scan_state = ScanState::Running {
                         progress: *progress,
-                        status: "Resuming...".to_string(),
+                        status: status.clone(),
                         elapsed_secs: *elapsed_secs,
                         eta_secs: None,
                     };
@@ -248,290 +443,230 @@ impl DuplicateFinderState {
                 if let Some(control) = &self.scan_control {
                     control.stop();
                 }
+                self.scan_control = None;
                 self.scan_state = ScanState::Idle;
+                self.status_message = Some(
+                    "Scan stopped. Groups found before stopping are kept in the scan history."
+                        .to_string(),
+                );
+                self.requests.push(FinderRequest::RefreshSessions);
             }
-            FinderMessage::ScanProgress(progress) => match progress {
-                ScanProgress::Status(s) => {
-                    if let ScanState::Running { ref mut status, .. } = self.scan_state {
-                        *status = s;
-                    }
-                }
-                ScanProgress::Progress {
-                    current,
-                    total,
-                    message,
-                    elapsed_secs: msg_elapsed,
-                    eta_secs: msg_eta,
-                } => {
-                    if let ScanState::Running {
-                        ref mut progress,
-                        ref mut status,
-                        ref mut elapsed_secs,
-                        ref mut eta_secs,
-                    } = self.scan_state
-                    {
-                        *progress = if total > 0 {
-                            current as f32 / total as f32
-                        } else {
-                            0.0
-                        };
-                        *status = message;
-                        *elapsed_secs = msg_elapsed;
-                        *eta_secs = msg_eta;
-                    }
-                }
-                ScanProgress::PhaseCompleted { category, groups } => {
-                    let results = self.results.get_or_insert(ResultsState {
-                        groups: HashMap::new(),
-                        selected_for_deletion: Default::default(),
-                        filter: None,
-                        show_results: false,
-                        deletion_message: None,
-                        preview: None,
-                        page: 0,
-                        page_size: 50,
-                    });
-                    results.groups.insert(category, groups);
-                }
-                ScanProgress::Completed => {
-                    self.scan_state = ScanState::Completed;
-                    self.scan_control = None;
-
-                    // Auto-show results if duplicates were found, otherwise notify
-                    if let Some(ref mut results) = self.results {
-                        let total_groups: usize = results.groups.values().map(|g| g.len()).sum();
-                        let total_files: usize = results
-                            .groups
-                            .values()
-                            .flat_map(|g| g.iter())
-                            .map(|g| g.files.len())
-                            .sum();
-                        if total_groups > 0 {
-                            results.show_results = true;
-                            self.status_message = Some(format!(
-                                "Scan complete! Found {} duplicate groups ({} files)",
-                                total_groups, total_files
-                            ));
-                        } else {
-                            self.status_message =
-                                Some("Scan complete. No duplicates found.".to_string());
-                        }
-                    } else {
-                        self.status_message =
-                            Some("Scan complete. No duplicates found.".to_string());
-                    }
-                }
-                ScanProgress::Error(e) => {
-                    self.scan_state = ScanState::Idle;
-                    self.scan_control = None;
-                    eprintln!("Scan error: {}", e);
-                }
-            },
+            FinderMessage::ScanProgress(progress) => return self.on_progress(progress),
             FinderMessage::ViewResults => {
                 if let Some(ref mut results) = self.results {
                     results.show_results = true;
                 }
+                return self.thumbnail_task();
             }
             FinderMessage::CloseResults => {
                 if let Some(ref mut results) = self.results {
                     results.show_results = false;
+                    results.confirm_delete = false;
                 }
+            }
+            FinderMessage::OpenSession(id) => self.requests.push(FinderRequest::OpenSession(id)),
+            FinderMessage::DeleteSession(id) => {
+                self.requests.push(FinderRequest::DeleteSession(id))
             }
             FinderMessage::FilterChanged(filter) => {
                 if let Some(ref mut results) = self.results {
                     results.filter = filter;
                     results.page = 0;
                 }
+                return self.thumbnail_task();
             }
             FinderMessage::ToggleFileForDeletion(path) => {
                 if let Some(ref mut results) = self.results {
-                    if results.selected_for_deletion.contains(&path) {
-                        results.selected_for_deletion.remove(&path);
-                    } else {
+                    if !results.selected_for_deletion.remove(&path) {
                         results.selected_for_deletion.insert(path);
                     }
-                }
-            }
-            FinderMessage::SelectAll => {
-                if let Some(ref mut results) = self.results {
-                    // Select all files across all visible groups
-                    for (category, groups) in &results.groups {
-                        if let Some(f) = &results.filter {
-                            if category != f {
-                                continue;
-                            }
-                        }
-                        for group in groups {
-                            for file in &group.files {
-                                results
-                                    .selected_for_deletion
-                                    .insert(file.to_string_lossy().to_string());
-                            }
-                        }
-                    }
+                    results.confirm_delete = false;
                 }
             }
             FinderMessage::SelectNone => {
                 if let Some(ref mut results) = self.results {
                     results.selected_for_deletion.clear();
+                    results.confirm_delete = false;
                 }
             }
-            FinderMessage::KeepNewest => {
+            FinderMessage::ApplyKeep(strategy) => {
                 if let Some(ref mut results) = self.results {
                     results.selected_for_deletion.clear();
-                    for (category, groups) in &results.groups {
-                        if let Some(f) = &results.filter {
-                            if category != f {
-                                continue;
-                            }
-                        }
-                        for group in groups {
-                            if group.files.len() < 2 {
-                                continue;
-                            }
-                            // Find newest file by modification time
-                            let newest = group.files.iter().max_by_key(|f| {
-                                std::fs::metadata(f)
-                                    .and_then(|m| m.modified())
-                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                            });
-                            // Select all except newest for deletion
-                            for file in &group.files {
-                                if newest.map(|n| n != file).unwrap_or(false) {
-                                    results
-                                        .selected_for_deletion
-                                        .insert(file.to_string_lossy().to_string());
-                                }
-                            }
+                    results.confirm_delete = false;
+                    let mut groups = 0;
+                    for i in results.visible() {
+                        if let Some(plan) =
+                            cleanup::plan_group(&results.groups[i].group.files, strategy)
+                        {
+                            groups += 1;
+                            results.selected_for_deletion.extend(plan.remove);
                         }
                     }
-                }
-            }
-            FinderMessage::KeepLargest => {
-                if let Some(ref mut results) = self.results {
-                    results.selected_for_deletion.clear();
-                    for (category, groups) in &results.groups {
-                        if let Some(f) = &results.filter {
-                            if category != f {
-                                continue;
-                            }
-                        }
-                        for group in groups {
-                            if group.files.len() < 2 {
-                                continue;
-                            }
-                            // Find largest file by size
-                            let largest = group
-                                .files
-                                .iter()
-                                .max_by_key(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0));
-                            // Select all except largest for deletion
-                            for file in &group.files {
-                                if largest.map(|l| l != file).unwrap_or(false) {
-                                    results
-                                        .selected_for_deletion
-                                        .insert(file.to_string_lossy().to_string());
-                                }
-                            }
-                        }
-                    }
+                    results.message = Some(format!(
+                        "{strategy}: selected {} extra copies in {groups} groups. Review, then press Remove.",
+                        results.selected_for_deletion.len()
+                    ));
                 }
             }
             FinderMessage::DeleteSelected => {
                 if let Some(ref mut results) = self.results {
-                    let to_delete: Vec<String> =
-                        results.selected_for_deletion.iter().cloned().collect();
-                    let mut deleted = 0u32;
-                    let mut failed = Vec::new();
-
-                    for path_str in &to_delete {
-                        match std::fs::remove_file(path_str) {
-                            Ok(_) => {
-                                deleted += 1;
-                                // Remove from groups
-                                for groups in results.groups.values_mut() {
-                                    for group in groups.iter_mut() {
-                                        group
-                                            .files
-                                            .retain(|f| f.to_string_lossy() != path_str.as_str());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                failed.push(format!("{}: {}", path_str, e));
-                            }
-                        }
+                    if !results.selected_for_deletion.is_empty() {
+                        results.confirm_delete = true;
                     }
-
-                    results.selected_for_deletion.clear();
-
-                    // Remove empty groups
-                    for groups in results.groups.values_mut() {
-                        groups.retain(|g| g.files.len() >= 2);
-                    }
-
-                    results.deletion_message = Some(format!(
-                        "Deleted {} files{}",
-                        deleted,
-                        if failed.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {} failed", failed.len())
-                        }
-                    ));
                 }
+            }
+            FinderMessage::CancelDelete => {
+                if let Some(ref mut results) = self.results {
+                    results.confirm_delete = false;
+                }
+            }
+            FinderMessage::ConfirmDelete => {
+                let mode = self.remove_mode;
+                if let Some(ref mut results) = self.results {
+                    results.confirm_delete = false;
+                    let groups: Vec<&[PathBuf]> = results
+                        .groups
+                        .iter()
+                        .map(|g| g.group.files.as_slice())
+                        .collect();
+                    let (safe, protected) =
+                        cleanup::protect_last_copies(groups, &results.selected_for_deletion);
+                    if safe.is_empty() {
+                        results.message = Some(
+                            "Nothing removed: every selected file is the last remaining copy in its group."
+                                .to_string(),
+                        );
+                        return Task::none();
+                    }
+                    results.deleting = true;
+                    results.message = Some(format!("Removing {} files...", safe.len()));
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || cleanup::remove_files(&safe, mode))
+                                .await
+                                .unwrap_or_default()
+                        },
+                        move |report| FinderMessage::DeleteFinished(Arc::new(report), protected),
+                    );
+                }
+            }
+            FinderMessage::DeleteFinished(report, protected) => {
+                if let Some(ref mut results) = self.results {
+                    results.deleting = false;
+                    let removed: HashSet<&PathBuf> = report.removed.iter().collect();
+                    for g in results.groups.iter_mut() {
+                        g.group.files.retain(|f| !removed.contains(f));
+                    }
+                    results.groups.retain(|g| g.group.files.len() >= 2);
+                    results
+                        .selected_for_deletion
+                        .retain(|p| !removed.contains(p));
+                    results.page = results.page.min(results.last_page());
+
+                    let verb = match self.remove_mode {
+                        RemoveMode::Trash => "Moved to trash",
+                        RemoveMode::Permanent => "Deleted",
+                    };
+                    let mut msg = format!(
+                        "{verb}: {} files ({} freed).",
+                        report.removed.len(),
+                        format_size(report.bytes_freed)
+                    );
+                    if protected > 0 {
+                        msg.push_str(&format!(
+                            " Kept one copy in {protected} groups where every file was selected."
+                        ));
+                    }
+                    if let Some((p, e)) = report.failed.first() {
+                        msg.push_str(&format!(
+                            " {} failed (e.g. {}: {e}).",
+                            report.failed.len(),
+                            p.display()
+                        ));
+                    }
+                    results.message = Some(msg);
+
+                    if let Some(session_id) = results.session_id {
+                        self.requests.push(FinderRequest::FilesRemoved {
+                            session_id,
+                            paths: report
+                                .removed
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect(),
+                        });
+                    }
+                }
+                return self.thumbnail_task();
             }
             FinderMessage::ExportResults => {
                 if let Some(ref results) = self.results {
-                    // Build CSV content
                     let mut csv =
                         String::from("group_id,file_type,similarity,file_path,file_size_bytes\n");
-                    let mut group_id = 0u32;
-                    for (category, groups) in &results.groups {
-                        for group in groups {
-                            group_id += 1;
-                            for file in &group.files {
-                                let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-                                csv.push_str(&format!(
-                                    "{},{},{:.4},\"{}\",{}\n",
-                                    group_id,
-                                    category.label(),
-                                    group.similarity,
-                                    file.to_string_lossy().replace('"', "\"\""),
-                                    size,
-                                ));
-                            }
+                    for (i, g) in results.groups.iter().enumerate() {
+                        for file in &g.group.files {
+                            let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+                            let path = file.to_string_lossy();
+                            let path = if path.contains([',', '"', '\n']) {
+                                format!("\"{}\"", path.replace('"', "\"\""))
+                            } else {
+                                path.into_owned()
+                            };
+                            csv.push_str(&format!(
+                                "{},{},{:.4},{},{}\n",
+                                i + 1,
+                                g.category.label(),
+                                g.group.similarity,
+                                path,
+                                size,
+                            ));
                         }
                     }
-
-                    let csv_clone = csv;
                     return Task::perform(
                         async move {
-                            let handle = rfd::AsyncFileDialog::new()
+                            let Some(h) = rfd::AsyncFileDialog::new()
                                 .set_file_name("duplicates.csv")
                                 .add_filter("CSV", &["csv"])
-                                .add_filter("Text", &["txt"])
                                 .save_file()
-                                .await;
-                            if let Some(h) = handle {
-                                let _ = std::fs::write(h.path(), csv_clone);
-                            }
+                                .await
+                            else {
+                                return Ok(None);
+                            };
+                            std::fs::write(h.path(), csv)
+                                .map(|_| Some(h.path().display().to_string()))
+                                .map_err(|e| e.to_string())
                         },
-                        |_| FinderMessage::SelectNone, // no-op after export
+                        FinderMessage::Exported,
                     );
+                }
+            }
+            FinderMessage::Exported(result) => {
+                if let Some(ref mut results) = self.results {
+                    results.message = match result {
+                        Ok(Some(p)) => Some(format!("Exported to {p}")),
+                        Ok(None) => None,
+                        Err(e) => Some(format!("Export failed: {e}")),
+                    };
                 }
             }
             FinderMessage::PreviewFile(path, category) => {
                 if let Some(ref mut results) = self.results {
-                    // Pre-render for PDFs and videos
-                    let rendered = render_preview_image(&path, &category, 0);
                     results.preview = Some(PreviewFile {
-                        path,
+                        path: path.clone(),
                         category,
                         zoom: 1.0,
                         pdf_page: 0,
-                        rendered_image: rendered,
+                        data: None,
                     });
+                    return preview_task(path, category, 0, self.dark);
+                }
+            }
+            FinderMessage::PreviewReady(data) => {
+                if let Some(pf) = self.results.as_mut().and_then(|r| r.preview.as_mut()) {
+                    // Ignore results for a file/page that is no longer shown.
+                    if pf.path == data.path && pf.pdf_page == data.page {
+                        pf.data = Some(*data);
+                    }
                 }
             }
             FinderMessage::ClosePreview => {
@@ -540,129 +675,174 @@ impl DuplicateFinderState {
                 }
             }
             FinderMessage::OpenInExplorer(path) => {
-                let file_path = std::path::Path::new(&path);
-                if let Some(parent) = file_path.parent() {
-                    let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-                }
+                crate::platform::reveal_in_folder(std::path::Path::new(&path))
             }
             FinderMessage::OpenWithSystem(path) => {
-                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                crate::platform::open_path(std::path::Path::new(&path))
             }
-            FinderMessage::ZoomIn => {
-                if let Some(ref mut results) = self.results {
-                    if let Some(ref mut pf) = results.preview {
-                        pf.zoom = (pf.zoom * 1.25).min(5.0);
-                    }
+            FinderMessage::ZoomIn | FinderMessage::ZoomOut | FinderMessage::ZoomReset => {
+                if let Some(pf) = self.results.as_mut().and_then(|r| r.preview.as_mut()) {
+                    pf.zoom = match message {
+                        FinderMessage::ZoomIn => (pf.zoom * 1.25).min(5.0),
+                        FinderMessage::ZoomOut => (pf.zoom / 1.25).max(0.2),
+                        _ => 1.0,
+                    };
                 }
             }
-            FinderMessage::ZoomOut => {
-                if let Some(ref mut results) = self.results {
-                    if let Some(ref mut pf) = results.preview {
-                        pf.zoom = (pf.zoom / 1.25).max(0.2);
+            FinderMessage::PdfNextPage | FinderMessage::PdfPrevPage => {
+                let dark = self.dark;
+                if let Some(pf) = self.results.as_mut().and_then(|r| r.preview.as_mut()) {
+                    let next = matches!(message, FinderMessage::PdfNextPage);
+                    if !next && pf.pdf_page == 0 {
+                        return Task::none();
                     }
+                    pf.pdf_page = if next {
+                        pf.pdf_page + 1
+                    } else {
+                        pf.pdf_page - 1
+                    };
+                    pf.data = None;
+                    return preview_task(pf.path.clone(), pf.category, pf.pdf_page, dark);
                 }
             }
-            FinderMessage::ZoomReset => {
+            FinderMessage::PageNext
+            | FinderMessage::PagePrev
+            | FinderMessage::PageFirst
+            | FinderMessage::PageLast => {
                 if let Some(ref mut results) = self.results {
-                    if let Some(ref mut pf) = results.preview {
-                        pf.zoom = 1.0;
-                    }
+                    let last = results.last_page();
+                    results.page = match message {
+                        FinderMessage::PageNext => (results.page + 1).min(last),
+                        FinderMessage::PagePrev => results.page.saturating_sub(1),
+                        FinderMessage::PageFirst => 0,
+                        _ => last,
+                    };
                 }
+                return self.thumbnail_task();
             }
-            FinderMessage::PdfNextPage => {
+            FinderMessage::ThumbnailsReady(list) => {
                 if let Some(ref mut results) = self.results {
-                    if let Some(ref mut pf) = results.preview {
-                        pf.pdf_page += 1;
-                        pf.rendered_image =
-                            render_preview_image(&pf.path, &pf.category, pf.pdf_page);
-                    }
-                }
-            }
-            FinderMessage::PdfPrevPage => {
-                if let Some(ref mut results) = self.results {
-                    if let Some(ref mut pf) = results.preview {
-                        if pf.pdf_page > 0 {
-                            pf.pdf_page -= 1;
-                            pf.rendered_image =
-                                render_preview_image(&pf.path, &pf.category, pf.pdf_page);
+                    for (file, thumb) in list {
+                        if let Some(t) = thumb {
+                            results.thumbnails.insert(file, t);
                         }
                     }
-                }
-            }
-            FinderMessage::PageNext => {
-                if let Some(ref mut results) = self.results {
-                    let total: usize = results
-                        .groups
-                        .iter()
-                        .filter(|(c, _)| results.filter.is_none_or(|f| *c == &f))
-                        .map(|(_, g)| g.len())
-                        .sum();
-                    let last_page = if results.page_size > 0 {
-                        total.saturating_sub(1) / results.page_size
-                    } else {
-                        0
-                    };
-                    if results.page < last_page {
-                        results.page += 1;
-                    }
-                }
-            }
-            FinderMessage::PagePrev => {
-                if let Some(ref mut results) = self.results {
-                    results.page = results.page.saturating_sub(1);
-                }
-            }
-            FinderMessage::PageFirst => {
-                if let Some(ref mut results) = self.results {
-                    results.page = 0;
-                }
-            }
-            FinderMessage::PageLast => {
-                if let Some(ref mut results) = self.results {
-                    let total: usize = results
-                        .groups
-                        .iter()
-                        .filter(|(c, _)| results.filter.is_none_or(|f| *c == &f))
-                        .map(|(_, g)| g.len())
-                        .sum();
-                    results.page = if results.page_size > 0 {
-                        total.saturating_sub(1) / results.page_size
-                    } else {
-                        0
-                    };
                 }
             }
         }
         Task::none()
     }
 
+    fn on_progress(&mut self, progress: ScanProgress) -> Task<FinderMessage> {
+        match progress {
+            ScanProgress::Status(s) => match &mut self.scan_state {
+                ScanState::Running { status, .. } | ScanState::Paused { status, .. } => *status = s,
+                _ => {}
+            },
+            ScanProgress::Progress {
+                current,
+                total,
+                message,
+                elapsed_secs: msg_elapsed,
+                eta_secs: msg_eta,
+            } => {
+                if let ScanState::Running {
+                    progress,
+                    status,
+                    elapsed_secs,
+                    eta_secs,
+                } = &mut self.scan_state
+                {
+                    *progress = if total > 0 {
+                        current as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    *status = message;
+                    *elapsed_secs = msg_elapsed;
+                    *eta_secs = msg_eta;
+                }
+            }
+            ScanProgress::PhaseCompleted { category, groups } => {
+                let results = self
+                    .results
+                    .get_or_insert_with(|| ResultsState::new(self.current_session_id, Vec::new()));
+                results.groups.extend(
+                    groups
+                        .into_iter()
+                        .map(|group| ResultGroup { category, group }),
+                );
+            }
+            ScanProgress::Completed => {
+                if !self.scan_state.is_active() {
+                    return Task::none(); // stopped by the user
+                }
+                self.scan_state = ScanState::Completed;
+                self.scan_control = None;
+                self.requests.push(FinderRequest::RefreshSessions);
+                let found = self.results.as_ref().map(|r| r.counts()).unwrap_or((0, 0));
+                if found.0 > 0 {
+                    self.status_message = Some(format!(
+                        "Scan complete: {} duplicate groups ({} files).",
+                        found.0, found.1
+                    ));
+                    if let Some(r) = self.results.as_mut() {
+                        r.show_results = true;
+                    }
+                    return self.thumbnail_task();
+                }
+                self.results = None;
+                self.status_message = Some("Scan complete. No duplicates found.".to_string());
+            }
+            ScanProgress::Error(e) => {
+                self.scan_state = ScanState::Idle;
+                self.scan_control = None;
+                self.status_message = Some(format!("Scan failed: {e}"));
+            }
+        }
+        Task::none()
+    }
+
     pub fn view(&self) -> Element<'_, FinderMessage> {
+        let active = self.scan_state.is_active();
         let mut content = column![].spacing(12).padding([16, 24]);
 
         // -- Scan Paths --
-        content = content.push(text("Scan Paths").size(16));
-
+        content = content.push(text("Folders to scan").size(16));
+        if self.paths.is_empty() {
+            content = content.push(
+                text("Add one or more folders, choose the kinds of files to compare, then start the scan.")
+                    .size(13)
+                    .style(text::secondary),
+            );
+        }
         for (i, path) in self.paths.iter().enumerate() {
+            let mut remove = button(text("Remove").size(12))
+                .padding([4, 10])
+                .style(button::secondary);
+            if !active {
+                remove = remove.on_press(FinderMessage::RemovePath(i));
+            }
             content = content.push(
                 container(
-                    row![
-                        text(path).size(13).width(Length::Fill),
-                        button(text("Remove").size(12))
-                            .padding([4, 10])
-                            .on_press(FinderMessage::RemovePath(i)),
-                    ]
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center),
+                    row![text(path).size(13).width(Length::Fill), remove]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
                 )
-                .padding([6, 12]),
+                .padding([6, 12])
+                .style(container::rounded_box),
             );
         }
 
+        let mut add = button("Add folder");
+        if !active {
+            add = add.on_press(FinderMessage::AddFolder);
+        }
         content = content.push(
             row![
-                button("Add Folder").on_press(FinderMessage::AddFolder),
-                checkbox("Include subdirectories", self.include_subdirs)
-                    .on_toggle(FinderMessage::ToggleSubdirs),
+                add,
+                checkbox("Include subfolders", self.include_subdirs)
+                    .on_toggle_maybe((!active).then_some(FinderMessage::ToggleSubdirs)),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -670,29 +850,40 @@ impl DuplicateFinderState {
 
         // -- File Types --
         content = content.push(Rule::horizontal(1));
-        content = content.push(text("File Types").size(16));
+        content = content.push(text("Compare").size(16));
+        let toggle = |label: &'static str, on: bool, cat: FileCategory| {
+            checkbox(label, on).on_toggle_maybe(
+                (!active).then_some(move |v| FinderMessage::ToggleFileType(cat, v)),
+            )
+        };
         content = content.push(
             row![
-                checkbox("Images", self.file_types.image)
-                    .on_toggle(|v| FinderMessage::ToggleFileType(FileCategory::Image, v)),
-                checkbox("Documents", self.file_types.document)
-                    .on_toggle(|v| FinderMessage::ToggleFileType(FileCategory::Document, v)),
-                checkbox("Videos", self.file_types.video)
-                    .on_toggle(|v| FinderMessage::ToggleFileType(FileCategory::Video, v)),
-                checkbox("Archives", self.file_types.archive)
-                    .on_toggle(|v| FinderMessage::ToggleFileType(FileCategory::Archive, v)),
-                checkbox("Code", self.file_types.code)
-                    .on_toggle(|v| FinderMessage::ToggleFileType(FileCategory::Code, v)),
+                toggle("Images", self.file_types.image, FileCategory::Image),
+                toggle(
+                    "Documents",
+                    self.file_types.document,
+                    FileCategory::Document
+                ),
+                toggle("Videos", self.file_types.video, FileCategory::Video),
+                toggle("Archives", self.file_types.archive, FileCategory::Archive),
+                toggle("Code", self.file_types.code, FileCategory::Code),
             ]
             .spacing(15),
         );
 
         // -- Threshold --
-        content = content.push(Rule::horizontal(1));
+        let threshold_hint = match self.threshold {
+            100 => "identical content only",
+            96..=99 => "near-identical (resized, re-saved, lightly edited)",
+            90..=95 => "similar (recommended)",
+            80..=89 => "loosely similar — expect some false matches",
+            _ => "very loose — many false matches",
+        };
         content = content.push(
             row![
-                text(format!("Similarity Threshold: {}%", self.threshold)),
-                slider(80..=100, self.threshold, FinderMessage::ThresholdChanged).width(200),
+                text(format!("Similarity: {}%", self.threshold)).width(140),
+                slider(70..=100, self.threshold, FinderMessage::ThresholdChanged).width(220),
+                text(threshold_hint).size(12).style(text::secondary),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -702,14 +893,16 @@ impl DuplicateFinderState {
         content = content.push(Rule::horizontal(1));
         let controls = match &self.scan_state {
             ScanState::Idle | ScanState::Completed => {
-                let mut start = button(text("Start Scan").size(14)).padding([8, 24]);
-                if !self.paths.is_empty() {
+                let mut start = button(text("Start scan").size(14))
+                    .padding([8, 24])
+                    .style(button::primary);
+                if self.can_start() {
                     start = start.on_press(FinderMessage::StartScan);
                 }
                 let mut r = row![start].spacing(10);
-                if matches!(self.scan_state, ScanState::Completed) && self.results.is_some() {
+                if self.results.is_some() {
                     r = r.push(
-                        button(text("View Results").size(14))
+                        button(text("View results").size(14))
                             .padding([8, 24])
                             .on_press(FinderMessage::ViewResults),
                     );
@@ -722,6 +915,7 @@ impl DuplicateFinderState {
                     .on_press(FinderMessage::PauseScan),
                 button(text("Stop").size(13))
                     .padding([6, 16])
+                    .style(button::danger)
                     .on_press(FinderMessage::StopScan),
             ]
             .spacing(10),
@@ -731,6 +925,7 @@ impl DuplicateFinderState {
                     .on_press(FinderMessage::ResumeScan),
                 button(text("Stop").size(13))
                     .padding([6, 16])
+                    .style(button::danger)
                     .on_press(FinderMessage::StopScan),
             ]
             .spacing(10),
@@ -744,45 +939,82 @@ impl DuplicateFinderState {
                 status,
                 elapsed_secs,
                 eta_secs,
-            }
-            | ScanState::Paused {
-                progress,
-                status,
-                elapsed_secs,
-                eta_secs,
             } => {
-                let progress_section = {
-                    let mut timing =
-                        format!("{} | Elapsed: {}", status, format_duration(*elapsed_secs));
-                    if let Some(eta) = eta_secs {
-                        timing.push_str(&format!(" | ETA: {}", format_duration(*eta)));
-                    }
-                    container(
-                        column![
-                            progress_bar(0.0..=1.0, *progress).height(20),
-                            text(timing).size(13),
-                        ]
-                        .spacing(6),
-                    )
-                    .padding([10, 0])
-                };
-                content = content.push(progress_section);
+                let mut timing = format!("{} · {} elapsed", status, format_duration(*elapsed_secs));
+                if let Some(eta) = eta_secs {
+                    timing.push_str(&format!(" · ~{} left", format_duration(*eta)));
+                }
+                content = content.push(
+                    column![
+                        progress_bar(0.0..=1.0, *progress).height(20),
+                        text(timing).size(13)
+                    ]
+                    .spacing(6),
+                );
+            }
+            ScanState::Paused {
+                progress, status, ..
+            } => {
+                content = content.push(
+                    column![
+                        progress_bar(0.0..=1.0, *progress).height(20),
+                        text(format!("Paused · {status}")).size(13)
+                    ]
+                    .spacing(6),
+                );
             }
             _ => {}
         }
 
-        // -- Status message --
         if let Some(ref msg) = self.status_message {
             content = content.push(container(text(msg).size(14)).padding([8, 12]));
+        }
+
+        // -- Recent scans --
+        if !self.recent_sessions.is_empty() {
+            content = content.push(Rule::horizontal(1));
+            content = content.push(text("Recent scans").size(16));
+            for s in self.recent_sessions.iter().take(8) {
+                let mut open = button(text("Open").size(12)).padding([4, 12]);
+                if s.groups > 0 && !active {
+                    open = open.on_press(FinderMessage::OpenSession(s.id));
+                }
+                let mut forget = button(text("Forget").size(12))
+                    .padding([4, 10])
+                    .style(button::secondary);
+                if !active {
+                    forget = forget.on_press(FinderMessage::DeleteSession(s.id));
+                }
+                content = content.push(
+                    container(
+                        row![
+                            column![
+                                text(truncate_end(&s.name, 60)).size(13),
+                                text(format!(
+                                    "{} · {} groups, {} files · {}",
+                                    s.created_at, s.groups, s.files, s.status
+                                ))
+                                .size(11)
+                                .style(text::secondary),
+                            ]
+                            .width(Length::Fill),
+                            open,
+                            forget,
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([6, 12])
+                    .style(container::rounded_box),
+                );
+            }
         }
 
         scrollable(container(content).width(Length::Fill)).into()
     }
 }
 
-/// Render a preview image for PDFs (via pdftoppm) or videos (via ffmpeg).
-/// Returns the path to a temp PNG file, or None if rendering fails.
-fn format_duration(secs: f64) -> String {
+pub fn format_duration(secs: f64) -> String {
     let total = secs as u64;
     let h = total / 3600;
     let m = (total % 3600) / 60;
@@ -796,140 +1028,119 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-fn render_preview_image(file_path: &str, category: &FileCategory, page: usize) -> Option<String> {
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("shingan")
-        .join("previews");
-    std::fs::create_dir_all(&cache_dir).ok()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    match category {
-        FileCategory::Document if file_path.ends_with(".pdf") => {
-            // Use pdftoppm to render a specific page
-            let out_prefix = cache_dir.join(format!("pdf_{:x}_p{}", simple_hash(file_path), page));
-            let out_file = format!("{}-{:06}.png", out_prefix.display(), page + 1);
-
-            // Check cache
-            if std::path::Path::new(&out_file).exists() {
-                return Some(out_file);
-            }
-
-            let first = (page + 1).to_string();
-            let last = first.clone();
-            let status = std::process::Command::new("pdftoppm")
-                .args([
-                    "-png",
-                    "-r",
-                    "150",
-                    "-f",
-                    &first,
-                    "-l",
-                    &last,
-                    file_path,
-                    &out_prefix.to_string_lossy(),
-                ])
-                .output();
-
-            match status {
-                Ok(output) if output.status.success() => {
-                    // pdftoppm names files as prefix-NNNNNN.png
-                    if std::path::Path::new(&out_file).exists() {
-                        Some(out_file)
-                    } else {
-                        // Try alternate naming (single digit)
-                        let alt = format!("{}-{}.png", out_prefix.display(), page + 1);
-                        if std::path::Path::new(&alt).exists() {
-                            Some(alt)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            }
-        }
-        FileCategory::Video => {
-            // Use ffmpeg to extract a single frame at 5 seconds
-            let out_file = cache_dir.join(format!("vid_{:x}.jpg", simple_hash(file_path)));
-
-            if out_file.exists() {
-                return Some(out_file.to_string_lossy().to_string());
-            }
-
-            let status = std::process::Command::new("ffmpeg")
-                .args([
-                    "-ss",
-                    "5",
-                    "-i",
-                    file_path,
-                    "-vframes",
-                    "1",
-                    "-q:v",
-                    "2",
-                    "-y",
-                    &out_file.to_string_lossy(),
-                ])
-                .stderr(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .output();
-
-            match status {
-                Ok(output) if output.status.success() && out_file.exists() => {
-                    Some(out_file.to_string_lossy().to_string())
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Generate a video thumbnail for display in file cards.
-/// Cached in ~/.cache/shingan/thumbnails/.
-pub fn video_thumbnail_path(video_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("shingan")
-        .join("thumbnails");
-    std::fs::create_dir_all(&cache_dir).ok()?;
-
-    let out_file = cache_dir.join(format!(
-        "vid_{:x}.jpg",
-        simple_hash(&video_path.to_string_lossy())
-    ));
-
-    if out_file.exists() {
-        return Some(out_file);
+    fn results_with(dir: &std::path::Path) -> (ResultsState, Vec<PathBuf>) {
+        let files: Vec<PathBuf> = ["a.jpg", "b.jpg", "c.jpg"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(n);
+                std::fs::write(&p, n.as_bytes()).unwrap();
+                p
+            })
+            .collect();
+        let group = DuplicateGroup {
+            files: files.clone(),
+            similarity: 1.0,
+        };
+        (
+            ResultsState::new(
+                Some(1),
+                vec![ResultGroup {
+                    category: FileCategory::Image,
+                    group,
+                }],
+            ),
+            files,
+        )
     }
 
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-ss",
-            "3",
-            "-i",
-            &video_path.to_string_lossy(),
-            "-vframes",
-            "1",
-            "-vf",
-            "scale=280:-1",
-            "-q:v",
-            "4",
-            "-y",
-            &out_file.to_string_lossy(),
-        ])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .output();
-
-    match status {
-        Ok(output) if output.status.success() && out_file.exists() => Some(out_file),
-        _ => None,
+    #[test]
+    fn pause_and_resume_keep_the_same_scan() {
+        let mut s = DuplicateFinderState {
+            paths: vec!["/tmp".into()],
+            ..Default::default()
+        };
+        let _ = s.update(FinderMessage::StartScan);
+        let generation = s.scan_generation;
+        let control = s.scan_control.clone().unwrap();
+        let _ = s.update(FinderMessage::PauseScan);
+        assert!(
+            s.scan_state.is_active(),
+            "paused scans must stay subscribed"
+        );
+        assert!(control.is_paused());
+        let _ = s.update(FinderMessage::ResumeScan);
+        assert!(matches!(s.scan_state, ScanState::Running { .. }));
+        assert_eq!(s.scan_generation, generation);
+        assert!(!control.is_paused());
     }
-}
 
-fn simple_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+    #[test]
+    fn delete_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (results, files) = results_with(dir.path());
+        let mut s = DuplicateFinderState {
+            results: Some(results),
+            ..Default::default()
+        };
+        let _ = s.update(FinderMessage::ToggleFileForDeletion(files[1].clone()));
+        let _ = s.update(FinderMessage::DeleteSelected);
+        assert!(s.results.as_ref().unwrap().confirm_delete);
+        assert!(files[1].exists(), "nothing deleted before confirming");
+        let _ = s.update(FinderMessage::CancelDelete);
+        assert!(!s.results.as_ref().unwrap().confirm_delete);
+    }
+
+    #[test]
+    fn keep_strategy_selects_all_but_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (results, _) = results_with(dir.path());
+        let mut s = DuplicateFinderState {
+            results: Some(results),
+            ..Default::default()
+        };
+        let _ = s.update(FinderMessage::ApplyKeep(KeepStrategy::ShortestPath));
+        assert_eq!(s.results.as_ref().unwrap().selected_for_deletion.len(), 2);
+    }
+
+    #[test]
+    fn finished_deletion_updates_groups_and_requests_db_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (results, files) = results_with(dir.path());
+        let mut s = DuplicateFinderState {
+            results: Some(results),
+            ..Default::default()
+        };
+        let report = RemoveReport {
+            removed: vec![files[0].clone(), files[1].clone()],
+            failed: vec![],
+            bytes_freed: 10,
+        };
+        let _ = s.update(FinderMessage::DeleteFinished(Arc::new(report), 0));
+        // One file left -> group disappears.
+        assert!(s.results.as_ref().unwrap().groups.is_empty());
+        assert!(matches!(
+            s.requests.last(),
+            Some(FinderRequest::FilesRemoved { session_id: 1, paths }) if paths.len() == 2
+        ));
+    }
+
+    #[test]
+    fn cannot_start_without_types() {
+        let mut s = DuplicateFinderState {
+            paths: vec!["/tmp".into()],
+            ..Default::default()
+        };
+        s.file_types = FileTypeSelection {
+            image: false,
+            document: false,
+            video: false,
+            archive: false,
+            code: false,
+        };
+        assert!(!s.can_start());
+    }
 }

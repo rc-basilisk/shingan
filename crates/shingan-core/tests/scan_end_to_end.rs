@@ -50,8 +50,11 @@ fn finds_near_duplicate_documents() {
         body.replacen("sentence 12 ", "sentence twelve ", 1),
     )
     .unwrap();
-    std::fs::write(dir.path().join("other.txt"), "completely different words ".repeat(50))
-        .unwrap();
+    std::fs::write(
+        dir.path().join("other.txt"),
+        "completely different words ".repeat(50),
+    )
+    .unwrap();
 
     let (groups, new_sigs) = scan(
         dir.path(),
@@ -75,7 +78,10 @@ fn finds_reformatted_code() {
     std::fs::write(dir.path().join("a.py"), &code).unwrap();
     std::fs::write(
         dir.path().join("b.py"),
-        format!("# copied from a.py\n{}", code.replace("    return", "        return")),
+        format!(
+            "# copied from a.py\n{}",
+            code.replace("    return", "        return")
+        ),
     )
     .unwrap();
 

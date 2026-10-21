@@ -240,7 +240,15 @@ fn main() -> anyhow::Result<()> {
             cloud,
             skip_unknown,
             dry_run,
-        } => cmd_sort(&settings, paths, dest, classify || cloud, cloud, skip_unknown, dry_run),
+        } => cmd_sort(
+            &settings,
+            paths,
+            dest,
+            classify || cloud,
+            cloud,
+            skip_unknown,
+            dry_run,
+        ),
         Commands::UndoSort { target } => cmd_undo_sort(&target),
         Commands::Model { action } => cmd_model(&settings, action),
         Commands::Doctor => cmd_doctor(&settings),
@@ -280,7 +288,9 @@ fn parse_categories(types: &[String]) -> anyhow::Result<Vec<FileCategory>> {
         match FileCategory::from_label(label) {
             Some(c) if !categories.contains(&c) => categories.push(c),
             Some(_) => {}
-            None => bail!("unknown file type '{t}'. Use: image, document, video, archive, code, all"),
+            None => {
+                bail!("unknown file type '{t}'. Use: image, document, video, archive, code, all")
+            }
         }
     }
     if categories.is_empty() {
@@ -316,7 +326,10 @@ fn build_detectors(
 fn cmd_scan(db: &Database, settings: &AppSettings, args: ScanArgs) -> anyhow::Result<()> {
     let categories = parse_categories(&args.types)?;
     if !(0.5..=1.0).contains(&args.threshold) {
-        bail!("threshold must be between 0.5 and 1.0 (got {})", args.threshold);
+        bail!(
+            "threshold must be between 0.5 and 1.0 (got {})",
+            args.threshold
+        );
     }
     for p in &args.paths {
         if !p.is_dir() {
@@ -406,7 +419,11 @@ fn cmd_scan(db: &Database, settings: &AppSettings, args: ScanArgs) -> anyhow::Re
                     eprintln!();
                     in_progress_line = false;
                 }
-                eprintln!("  Found {} {} duplicate groups", groups.len(), category.label());
+                eprintln!(
+                    "  Found {} {} duplicate groups",
+                    groups.len(),
+                    category.label()
+                );
                 persist_groups(db, session_id, category, &groups)?;
             }
             ScanProgress::Completed => {}
@@ -628,11 +645,9 @@ fn cmd_export(
     let groups = db
         .get_duplicate_groups(session_id)
         .context("Failed to get groups")?;
-    let format = format.unwrap_or_else(|| {
-        match output.extension().and_then(|e| e.to_str()) {
-            Some(e) if e.eq_ignore_ascii_case("json") => ExportFormat::Json,
-            _ => ExportFormat::Csv,
-        }
+    let format = format.unwrap_or_else(|| match output.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("json") => ExportFormat::Json,
+        _ => ExportFormat::Csv,
     });
 
     let content = match format {
@@ -719,7 +734,10 @@ fn cmd_delete(
     let mut to_remove: Vec<PathBuf> = Vec::new();
     let mut bytes = 0u64;
     for (group, entries) in &groups {
-        let files: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(&e.file_path)).collect();
+        let files: Vec<PathBuf> = entries
+            .iter()
+            .map(|e| PathBuf::from(&e.file_path))
+            .collect();
         let Some(plan) = cleanup::plan_group(&files, keep) else {
             continue;
         };
@@ -896,12 +914,21 @@ fn cmd_model(settings: &AppSettings, action: ModelAction) -> anyhow::Result<()> 
             println!(
                 "{}: {} ({})",
                 model.name,
-                if installed { "installed" } else { "not installed" },
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                },
                 dir.display()
             );
         }
         ModelAction::Download => {
-            println!("Downloading {} ({}) to {}", model.name, model.size_label, dir.display());
+            println!(
+                "Downloading {} ({}) to {}",
+                model.name,
+                model.size_label,
+                dir.display()
+            );
             reg::download_model_blocking(model, &dir, &|name, done, total| {
                 if total > 0 {
                     eprint!(
@@ -1024,7 +1051,10 @@ mod tests {
         assert_eq!(c, vec![FileCategory::Image, FileCategory::Document]);
         assert_eq!(parse_categories(&["all".into()]).unwrap().len(), 5);
         assert!(parse_categories(&["spreadsheets".into()]).is_err());
-        assert_eq!(parse_categories(&["docs".into()]).unwrap(), vec![FileCategory::Document]);
+        assert_eq!(
+            parse_categories(&["docs".into()]).unwrap(),
+            vec![FileCategory::Document]
+        );
     }
 
     #[test]

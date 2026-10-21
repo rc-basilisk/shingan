@@ -356,7 +356,9 @@ impl CloudCategorizer for HttpVisionCategorizer {
         }
         let json: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("{name}: invalid JSON: {e}"))?;
-        let text = self.extract_text(&json).map_err(|e| format!("{name}: {e}"))?;
+        let text = self
+            .extract_text(&json)
+            .map_err(|e| format!("{name}: {e}"))?;
         parse_label(&text).ok_or_else(|| format!("{name}: unknown category '{}'", text.trim()))
     }
 

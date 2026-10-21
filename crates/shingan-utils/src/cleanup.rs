@@ -189,7 +189,9 @@ pub struct RemoveReport {
 pub fn remove_file(path: &Path, mode: RemoveMode) -> Result<(), String> {
     match mode {
         RemoveMode::Trash => trash::delete(path).map_err(|e| {
-            format!("could not move to trash ({e}); use permanent deletion if this system has no trash")
+            format!(
+                "could not move to trash ({e}); use permanent deletion if this system has no trash"
+            )
         }),
         RemoveMode::Permanent => std::fs::remove_file(path).map_err(|e| e.to_string()),
     }
@@ -255,8 +257,7 @@ mod tests {
         let g1 = vec![a.clone(), b.clone()];
         let g2 = vec![c.clone(), d.clone()];
         let selected: HashSet<PathBuf> = [a.clone(), b.clone(), d.clone()].into();
-        let (safe, protected) =
-            protect_last_copies([g1.as_slice(), g2.as_slice()], &selected);
+        let (safe, protected) = protect_last_copies([g1.as_slice(), g2.as_slice()], &selected);
         assert_eq!(protected, 1);
         assert_eq!(safe, vec![b, d]);
     }

@@ -66,14 +66,22 @@ impl Detector for ImageDetector {
             None => return Ok(None),
         };
         // Hashers are cheap to build (the DCT one isn't Send/Sync, so it can't be stored).
-        let ahash = self.config().hash_alg(HashAlg::Mean).to_hasher().hash_image(&img);
+        let ahash = self
+            .config()
+            .hash_alg(HashAlg::Mean)
+            .to_hasher()
+            .hash_image(&img);
         let phash = self
             .config()
             .hash_alg(HashAlg::Mean)
             .preproc_dct()
             .to_hasher()
             .hash_image(&img);
-        let dhash = self.config().hash_alg(HashAlg::Gradient).to_hasher().hash_image(&img);
+        let dhash = self
+            .config()
+            .hash_alg(HashAlg::Gradient)
+            .to_hasher()
+            .hash_image(&img);
         Ok(Some(format!(
             "{SIG_VERSION}|{}|{}|{}",
             ahash.to_base64(),

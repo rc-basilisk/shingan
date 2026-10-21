@@ -269,12 +269,18 @@ mod tests {
 
     #[test]
     fn disabled_cloud_builds_nothing() {
-        assert!(AppSettings::default().cloud_categorizer().unwrap().is_none());
+        assert!(AppSettings::default()
+            .cloud_categorizer()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn provider_parse() {
-        assert_eq!(CloudProvider::parse("Claude"), Some(CloudProvider::Anthropic));
+        assert_eq!(
+            CloudProvider::parse("Claude"),
+            Some(CloudProvider::Anthropic)
+        );
         assert_eq!(CloudProvider::parse("nope"), None);
     }
 }

@@ -1,9 +1,9 @@
 use crate::models::*;
 use crate::schema;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
 use shingan_core::file_info::{FileCategory, FileInfo};
 use shingan_core::scanner::duplicate::{modified_secs, NewSignature, SignatureCache};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -329,7 +329,10 @@ impl Database {
     /// Delete a single scan session and its groups.
     pub fn delete_scan_session(&self, session_id: i64) -> Result<(), DbError> {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM scan_sessions WHERE id = ?1", params![session_id])?;
+            conn.execute(
+                "DELETE FROM scan_sessions WHERE id = ?1",
+                params![session_id],
+            )?;
             Ok(())
         })
     }

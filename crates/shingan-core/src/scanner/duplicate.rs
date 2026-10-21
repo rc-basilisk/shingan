@@ -25,7 +25,10 @@ pub struct NewSignature {
 }
 
 /// Duplicate groups keyed by category, plus newly computed signatures to persist.
-pub type ScanOutcome = (HashMap<FileCategory, Vec<DuplicateGroup>>, Vec<NewSignature>);
+pub type ScanOutcome = (
+    HashMap<FileCategory, Vec<DuplicateGroup>>,
+    Vec<NewSignature>,
+);
 
 /// A persistent store of previously computed signatures (e.g. the SQLite
 /// `signature_cache` table). Implementations must only return a signature

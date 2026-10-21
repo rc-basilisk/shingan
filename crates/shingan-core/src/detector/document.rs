@@ -19,10 +19,11 @@ impl DocumentDetector {
         Self { threshold }
     }
 
-    /// Extract text content from a document file.
-    fn extract_text(&self, path: &Path) -> Option<String> {
+    /// Extract human-readable text from a supported document, as-is (not
+    /// normalized). Useful for previews.
+    pub fn readable_text(path: &Path) -> Option<String> {
         let ext = path.extension()?.to_str()?.to_lowercase();
-        let text = match ext.as_str() {
+        match ext.as_str() {
             "txt" | "srt" | "vtt" | "sub" => Self::extract_plain_text(path),
             "rtf" => Self::extract_plain_text(path).map(|t| strip_rtf(&t)),
             "docx" => Self::extract_docx(path),
@@ -31,7 +32,12 @@ impl DocumentDetector {
             "odt" => Self::extract_odt(path),
             "pdf" => Self::extract_pdf(path),
             _ => None,
-        };
+        }
+    }
+
+    /// Extracted text, whitespace-normalized and lowercased for comparison.
+    fn extract_text(&self, path: &Path) -> Option<String> {
+        let text = Self::readable_text(path);
 
         if let Some(ref text) = text {
             let normalized: String = text
@@ -236,7 +242,10 @@ fn strip_rtf(rtf: &str) -> String {
                         while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
                             chars.next();
                         }
-                        while chars.peek().is_some_and(|c| c.is_ascii_digit() || *c == '-') {
+                        while chars
+                            .peek()
+                            .is_some_and(|c| c.is_ascii_digit() || *c == '-')
+                        {
                             chars.next();
                         }
                         if chars.peek() == Some(&' ') {
@@ -296,7 +305,9 @@ mod tests {
     #[test]
     fn near_duplicate_documents_match() {
         let dir = tempfile::tempdir().unwrap();
-        let body: String = (0..300).map(|i| format!("sentence number {i} goes here. ")).collect();
+        let body: String = (0..300)
+            .map(|i| format!("sentence number {i} goes here. "))
+            .collect();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
         std::fs::write(&a, &body).unwrap();
